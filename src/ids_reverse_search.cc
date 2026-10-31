@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -179,61 +180,6 @@ std::string NormalizeComponent(IdsStore& store,
 // ---------------------------------------------------------------------------
 // 查询代数
 // ---------------------------------------------------------------------------
-
-struct TokenizedComponents {
-  std::vector<std::string> base;
-  std::vector<std::string> neg;
-  std::vector<std::string> post;
-};
-
-TokenizedComponents ParseAlgebra(const std::vector<std::string>& components) {
-  std::vector<std::string> tokens;
-  for (const auto& raw : components) {
-    std::string s = StripSpace(raw);
-    std::string cur;
-    for (char c : s) {
-      if (c == '+' || c == '-') {
-        if (!cur.empty()) {
-          tokens.push_back(cur);
-          cur.clear();
-        }
-        tokens.push_back(std::string(1, c));
-      } else {
-        cur.push_back(c);
-      }
-    }
-    if (!cur.empty())
-      tokens.push_back(cur);
-  }
-
-  TokenizedComponents out;
-  std::string stage = "base";
-  char curr_op = '+';
-  for (const auto& t : tokens) {
-    if (t == "-") {
-      curr_op = '-';
-      if (stage == "base")
-        stage = "neg";
-    } else if (t == "+") {
-      curr_op = '+';
-      if (stage == "neg")
-        stage = "post";
-    } else {
-      if (curr_op == '-') {
-        out.neg.push_back(t);
-      } else if (stage == "neg") {
-        stage = "post";
-        out.post.push_back(t);
-      } else if (stage == "post") {
-        out.post.push_back(t);
-      } else {
-        out.base.push_back(t);
-      }
-      curr_op = '+';
-    }
-  }
-  return out;
-}
 
 // ---------------------------------------------------------------------------
 // IDS / 部件分解
@@ -588,63 +534,149 @@ std::vector<uint32_t> RankHybrid(IdsStore& store,
 }
 
 // ---------------------------------------------------------------------------
-// 减法
+// 加减代数与递归扣除
 // ---------------------------------------------------------------------------
 
-std::vector<uint32_t> SubtractComponents(IdsStore& store,
-                                         const std::vector<std::string>& base,
-                                         const std::vector<std::string>& neg,
-                                         const std::vector<std::string>& post,
-                                         const std::string& mode,
-                                         size_t max_results) {
-  std::vector<std::string> norm_neg;
-  for (const auto& n : neg) {
-    std::string s = StripSpace(n);
-    if (s.size() == 2 && IsAsciiAlphaOnly(s) && !store.py_map().count(s) &&
-        !store.FindKey(s)) {
-      s = DecodeShuangpin(store, s, mode);
-    }
-    norm_neg.push_back(Canon(s));
-  }
+struct AlgebraStep {
+  char op = '+';
+  std::string item;
+};
 
-  std::vector<uint32_t> sub_results;
-  hash_set<uint32_t> seen;
-  for (const auto& p : base) {
-    std::vector<std::string> leaves = TopLeavesOfComponent(store, p);
-    std::vector<std::string> remains;
-    std::vector<bool> used_neg(norm_neg.size(), false);
-    int matched = 0;
-    for (const auto& leaf : leaves) {
-      std::string norm_leaf = Canon(leaf);
-      bool found = false;
-      for (size_t i = 0; i < norm_neg.size(); ++i) {
-        if (!used_neg[i] && (norm_neg[i] == norm_leaf || norm_neg[i] == leaf)) {
-          used_neg[i] = true;
-          ++matched;
-          found = true;
-          break;
-        }
+// 单字部件保留原字形，供递归扣除读取其 IDS 结构；拼音编码仍走常规规范化。
+std::string NormalizeAlgebraItem(IdsStore& store,
+                                 const std::string& raw,
+                                 const std::string& mode) {
+  std::string s = StripSpace(raw);
+  if (Utf8Chars(s).size() == 1)
+    return s;
+  return NormalizeComponent(store, s, mode);
+}
+
+// 流式解析操作符：支持任意次 + / - 交替；汉字串按字符拆分为独立运算项。
+std::vector<AlgebraStep> ParseAlgebraSteps(
+    const std::vector<std::string>& components) {
+  std::vector<AlgebraStep> steps;
+  char curr_op = '+';
+  for (const auto& raw : components) {
+    std::string s = StripSpace(raw);
+    size_t i = 0;
+    while (i < s.size()) {
+      char c = s[i];
+      if (c == '+' || c == '-') {
+        curr_op = c;
+        ++i;
+        continue;
       }
-      if (!found)
-        remains.push_back(leaf);
-    }
-    if (matched == static_cast<int>(norm_neg.size()) && !remains.empty()) {
-      for (const auto& r : remains) {
-        std::vector<std::string> chars = Utf8Chars(r);
-        if (chars.size() != 1)
-          continue;
-        size_t pos = 0;
-        uint32_t cp = DecodeNext(r, &pos);
-        uint32_t id = store.IdOfCp(cp);
-        if (id != kInvalidId && seen.insert(id).second)
-          sub_results.push_back(id);
+      size_t start = i;
+      while (i < s.size() && s[i] != '+' && s[i] != '-')
+        ++i;
+      std::string item = s.substr(start, i - start);
+      if (item.empty())
+        continue;
+      if (IsAsciiAlphaOnly(item)) {
+        steps.push_back({curr_op, item});
+      } else {
+        for (const auto& ch : Utf8Chars(item))
+          steps.push_back({curr_op, ch});
       }
     }
   }
+  return steps;
+}
 
-  (void)post;
-  (void)max_results;
-  return sub_results;
+// 从 base 的深层部件中递归扣除 neg；成功返回剩余叶子，失败返回 nullopt。
+std::optional<std::vector<std::string>> SubtractCharacter(
+    IdsStore& store,
+    const std::string& base,
+    const std::string& neg,
+    int depth) {
+  std::string norm_base = Canon(base);
+  std::string norm_neg = Canon(neg);
+  if (norm_base == norm_neg)
+    return std::vector<std::string>{};
+  if (depth > 3 || AtomicComponents().count(base))
+    return std::nullopt;
+
+  std::vector<std::string> leaves = TopLeavesOfComponent(store, base);
+  if (leaves.size() <= 1 && !leaves.empty() && leaves[0] == norm_base)
+    return std::nullopt;
+
+  // 1. 直接叶子命中。
+  for (size_t i = 0; i < leaves.size(); ++i) {
+    if (leaves[i] == norm_neg) {
+      leaves.erase(leaves.begin() + static_cast<std::ptrdiff_t>(i));
+      return leaves;
+    }
+  }
+
+  // 2. 递归深入复合子部件展开。
+  std::vector<std::string> new_leaves;
+  bool sub_done = false;
+  for (const auto& leaf : leaves) {
+    if (!sub_done) {
+      auto sub = SubtractCharacter(store, leaf, norm_neg, depth + 1);
+      if (sub) {
+        new_leaves.insert(new_leaves.end(), sub->begin(), sub->end());
+        sub_done = true;
+        continue;
+      }
+    }
+    new_leaves.push_back(leaf);
+  }
+  if (sub_done)
+    return new_leaves;
+  return std::nullopt;
+}
+
+std::vector<std::string> ApplySingleSubtraction(
+    IdsStore& store,
+    const std::vector<std::string>& current,
+    const std::string& neg) {
+  // 优先从当前已有的复合字符中向下递归抠除。
+  for (size_t i = 0; i < current.size(); ++i) {
+    auto sub = SubtractCharacter(store, current[i], neg, 0);
+    if (!sub)
+      continue;
+    std::vector<std::string> out;
+    out.reserve(current.size() + sub->size());
+    out.insert(out.end(), current.begin(),
+               current.begin() + static_cast<std::ptrdiff_t>(i));
+    out.insert(out.end(), sub->begin(), sub->end());
+    out.insert(out.end(), current.begin() + static_cast<std::ptrdiff_t>(i + 1),
+               current.end());
+    return out;
+  }
+
+  // 若无法从字内抠除，尝试从当前部件列表中字面剔除。
+  for (size_t i = 0; i < current.size(); ++i) {
+    if (Canon(current[i]) == Canon(neg)) {
+      std::vector<std::string> out = current;
+      out.erase(out.begin() + static_cast<std::ptrdiff_t>(i));
+      return out;
+    }
+  }
+  return current;
+}
+
+std::vector<uint32_t> PureSubtractionResults(
+    IdsStore& store,
+    const std::vector<std::string>& components) {
+  std::vector<uint32_t> results;
+  hash_set<std::string> seen_comp;
+  hash_set<uint32_t> seen_id;
+  for (const auto& c : components) {
+    std::string key = Canon(c);
+    if (!seen_comp.insert(key).second)
+      continue;
+    if (Utf8Chars(c).size() != 1)
+      continue;
+    size_t pos = 0;
+    uint32_t cp = DecodeNext(c, &pos);
+    uint32_t id = store.IdOfCp(cp);
+    if (id != kInvalidId && seen_id.insert(id).second)
+      results.push_back(id);
+  }
+  return results;
 }
 
 }  // namespace
@@ -657,23 +689,33 @@ std::vector<uint32_t> SearchHybrid(IdsStore& store,
   if (components.empty())
     return {};
 
-  TokenizedComponents parsed = ParseAlgebra(components);
-  std::vector<std::string> pos_comps = parsed.base;
+  std::vector<AlgebraStep> steps = ParseAlgebraSteps(components);
+  std::vector<std::string> current;
+  bool pure_sub = true;
+  bool has_sub = false;
 
-  if (!parsed.neg.empty()) {
-    std::vector<uint32_t> sub = SubtractComponents(
-        store, parsed.base, parsed.neg, parsed.post, mode, max_results);
-    if (parsed.post.empty())
-      return sub;
-    pos_comps.clear();
-    for (uint32_t id : sub)
-      pos_comps.push_back(CpToUtf8(store.CpOfId(id)));
-    for (const auto& p : parsed.post)
-      pos_comps.push_back(p);
+  for (const auto& step : steps) {
+    std::string item = NormalizeAlgebraItem(store, step.item, mode);
+    if (item.empty())
+      continue;
+    if (step.op == '+') {
+      if (!current.empty() && has_sub)
+        pure_sub = false;
+      current.push_back(item);
+    } else {
+      has_sub = true;
+      current = ApplySingleSubtraction(store, current, item);
+    }
   }
 
+  // 纯减法直接返回剩余部件对应的单字。
+  if (pure_sub && has_sub && !current.empty())
+    return PureSubtractionResults(store, current);
+  if (current.empty())
+    return {};
+
   std::vector<std::string> normalized;
-  for (const auto& raw : pos_comps) {
+  for (const auto& raw : current) {
     std::string n = NormalizeComponent(store, raw, mode);
     if (!n.empty())
       normalized.push_back(n);
