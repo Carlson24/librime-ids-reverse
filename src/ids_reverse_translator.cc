@@ -1263,10 +1263,18 @@ std::shared_ptr<TermInfo> BuildTermInfo(IdsStore& store,
     std::string k1 = c + suffix;
     std::string k2 = cn + suffix;
     std::string use_k;
-    if (HasKey(store, k2))
+    if (HasKey(store, k2)) {
       use_k = k2;
-    else if (HasKey(store, k1))
+    } else if (HasKey(store, k1)) {
       use_k = k1;
+    } else if (mult > 1) {
+      // 缺少 *count key 时回退到基础 key，避免 data_size 变成 0 而被误选为
+      // base term，也保证后续过滤能使用完整 posting。
+      if (HasKey(store, cn))
+        use_k = cn;
+      else if (HasKey(store, c))
+        use_k = c;
+    }
     if (!use_k.empty() && seen_post.insert(use_k).second) {
       info->post_keys.push_back(use_k);
       if (static_cast<int>(info->post_keys.size()) >= max_keys)
@@ -1280,6 +1288,41 @@ std::shared_ptr<TermInfo> BuildTermInfo(IdsStore& store,
   }
   info->data_size = sz;
   return info;
+}
+
+// 精确多项查询的 base 候选：完整遍历 post_keys，不做数量截断。
+// 先取字频 head，再按 id 顺序补齐 full posting，并跨 key 去重。
+std::vector<uint32_t> GetCandidatesForTermFull(
+    IdsStore& store,
+    const TermInfo& term,
+    const hash_set<int>* disabled_blocks) {
+  std::vector<uint32_t> ids;
+  hash_set<uint32_t> seen;
+  for (const auto& key : term.post_keys) {
+    const KeyEntry* e = store.FindKey(key);
+    if (!e || e->full_cnt == 0)
+      continue;
+    const uint32_t* head = store.HeadIds(*e);
+    for (uint32_t i = 0; i < e->head_cnt; ++i) {
+      uint32_t id = head[i];
+      if (!seen.insert(id).second)
+        continue;
+      if (disabled_blocks &&
+          disabled_blocks->count(static_cast<int>(store.Hot(id).block)))
+        continue;
+      ids.push_back(id);
+    }
+    store.ForEachFull(*e, [&](uint32_t id) {
+      if (!seen.insert(id).second)
+        return true;
+      if (disabled_blocks &&
+          disabled_blocks->count(static_cast<int>(store.Hot(id).block)))
+        return true;
+      ids.push_back(id);
+      return true;
+    });
+  }
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,7 +1429,6 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
               return a->data_size < b->data_size;
             });
 
-  TermInfo* base = terms_info[0].get();
   bool has_any_pref = false;
   for (const auto& t : terms_info) {
     if (t->is_pref) {
@@ -1394,18 +1436,38 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
       break;
     }
   }
-  uint32_t base_limit = has_any_pref ? 1500 : 8000;
-  std::vector<uint32_t> current =
-      GetCandidatesForTerm(store, base->term, base->mult, base_limit,
-                           &base->post_keys, disabled_blocks,
-                           /*is_multi_term=*/true);
+
+  // base term 必须能提供 posting；空 post_keys 的项只能作为过滤条件。
+  TermInfo* base = nullptr;
+  for (const auto& t : terms_info) {
+    if (!t->post_keys.empty()) {
+      base = t.get();
+      break;
+    }
+  }
+  if (!base)
+    return {};
+
+  std::vector<uint32_t> current;
+  if (has_any_pref) {
+    // 前缀拼音检索保留原来的模糊候选上限。
+    constexpr uint32_t kPrefBaseLimit = 1500;
+    current = GetCandidatesForTerm(store, base->term, base->mult,
+                                   kPrefBaseLimit, &base->post_keys,
+                                   disabled_blocks, /*is_multi_term=*/true);
+  } else {
+    // 精确多项查询完整取 base 候选项，避免大 posting 按 id 截断造成漏字。
+    current = GetCandidatesForTermFull(store, *base, disabled_blocks);
+  }
   if (current.empty())
     return {};
 
-  for (size_t idx = 1; idx < terms_info.size(); ++idx) {
+  for (const auto& sp : terms_info) {
     if (current.empty())
       break;
-    TermInfo* t = terms_info[idx].get();
+    TermInfo* t = sp.get();
+    if (t == base)
+      continue;
     std::vector<uint32_t> filtered;
     filtered.reserve(current.size());
     for (uint32_t id : current) {

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -185,7 +186,11 @@ std::string NormalizeComponent(IdsStore& store,
 // IDS / 部件分解
 // ---------------------------------------------------------------------------
 
-std::vector<std::string> TopLeavesById(IdsStore& store, uint32_t id) {
+// preserve_glyph=false 时返回归一化部件（用于匹配/打分）；为 true 时保留
+// 数据中的原始字形（用于减法结果展示），例如 达 的 辶 不会被改写成 ⻌。
+std::vector<std::string> TopLeavesById(IdsStore& store,
+                                       uint32_t id,
+                                       bool preserve_glyph = false) {
   std::vector<std::string> leaves;
   if (id == kInvalidId)
     return leaves;
@@ -201,30 +206,34 @@ std::vector<std::string> TopLeavesById(IdsStore& store, uint32_t id) {
       uint32_t cp = DecodeNext(ch, &pos);
       if (IsIdc(cp))
         continue;
-      leaves.push_back(Canon(ch));
+      leaves.push_back(preserve_glyph ? ch : Canon(ch));
     }
   }
   if (leaves.empty()) {
     uint32_t cp = store.CpOfId(id);
-    if (cp)
-      leaves.push_back(Canon(CpToUtf8(cp)));
+    if (cp) {
+      std::string c = CpToUtf8(cp);
+      leaves.push_back(preserve_glyph ? c : Canon(c));
+    }
   }
   return leaves;
 }
 
 std::vector<std::string> TopLeavesOfComponent(IdsStore& store,
-                                              const std::string& comp) {
+                                              const std::string& comp,
+                                              bool preserve_glyph = false) {
   std::vector<std::string> chars = Utf8Chars(comp);
   if (chars.size() != 1)
-    return {Canon(comp)};
+    return {preserve_glyph ? comp : Canon(comp)};
   size_t pos = 0;
   uint32_t cp = DecodeNext(comp, &pos);
   uint32_t id = store.IdOfCp(cp);
   if (id == kInvalidId)
-    return {Canon(comp)};
-  std::vector<std::string> leaves = TopLeavesById(store, id);
+    return {preserve_glyph ? comp : Canon(comp)};
+  std::vector<std::string> leaves =
+      TopLeavesById(store, id, preserve_glyph);
   if (leaves.empty())
-    leaves.push_back(Canon(comp));
+    leaves.push_back(preserve_glyph ? comp : Canon(comp));
   return leaves;
 }
 
@@ -285,16 +294,6 @@ std::vector<std::string> AtomicDecomposition(
 // postings 读取 / 求交
 // ---------------------------------------------------------------------------
 
-void EmitKeyIds(IdsStore& store,
-                const KeyEntry& e,
-                std::vector<uint32_t>* out,
-                uint32_t limit) {
-  store.ForEachFull(e, [&](uint32_t id) {
-    out->push_back(id);
-    return out->size() < limit;
-  });
-}
-
 std::vector<std::string> KeysForTerm(IdsStore& store,
                                      const std::string& term,
                                      int count) {
@@ -330,60 +329,72 @@ std::vector<std::string> KeysForTerm(IdsStore& store,
   return keys;
 }
 
-std::vector<uint32_t> PostingIdsForTerm(IdsStore& store,
-                                        const std::string& term,
-                                        int count,
-                                        uint32_t limit) {
-  std::vector<uint32_t> ids;
-  hash_set<uint32_t> seen;
-  for (const auto& key : KeysForTerm(store, term, count)) {
-    const KeyEntry* e = store.FindKey(key);
-    if (!e || e->full_cnt == 0)
-      continue;
-    std::vector<uint32_t> part;
-    EmitKeyIds(store, *e, &part, limit);
-    for (uint32_t id : part) {
-      if (seen.insert(id).second)
-        ids.push_back(id);
-    }
-    if (ids.size() >= limit)
-      break;
-  }
-  return ids;
-}
-
+// 完整求交：选 union 最小的 term 作为种子，遍历其全部 posting，再用
+// FullContains 过滤其他 term。避免按 id 截断 posting 导致高 id 字符漏检。
 std::vector<uint32_t> IntersectPostings(IdsStore& store,
                                         const std::vector<std::string>& terms,
-                                        const std::vector<int>& counts,
-                                        uint32_t limit) {
+                                        const std::vector<int>& counts) {
   if (terms.empty())
     return {};
-  // 先分别取出各项候选，再从最小集合开始求交，尽量避免大集合截断造成漏字。
-  constexpr uint32_t kPerTermLimit = 20000;
-  std::vector<std::vector<uint32_t>> sets;
-  sets.reserve(terms.size());
-  size_t start = 0;
+
+  struct TermKeys {
+    std::vector<const KeyEntry*> entries;
+    uint64_t total = 0;
+  };
+
+  std::vector<TermKeys> term_keys;
+  term_keys.reserve(terms.size());
+  size_t seed_index = 0;
+  uint64_t seed_size = std::numeric_limits<uint64_t>::max();
+
   for (size_t i = 0; i < terms.size(); ++i) {
-    sets.push_back(PostingIdsForTerm(store, terms[i], counts[i],
-                                     std::max(kPerTermLimit, limit)));
-    if (sets.back().empty())
-      return {};
-    if (sets[i].size() < sets[start].size())
-      start = i;
-  }
-  std::vector<uint32_t> result = sets[start];
-  for (size_t i = 0; i < sets.size() && !result.empty(); ++i) {
-    if (i == start)
-      continue;
-    hash_set<uint32_t> next_set(sets[i].begin(), sets[i].end());
-    std::vector<uint32_t> filtered;
-    filtered.reserve(result.size());
-    for (uint32_t id : result) {
-      if (next_set.count(id))
-        filtered.push_back(id);
+    TermKeys tk;
+    hash_set<std::string> seen_keys;
+    for (const auto& key : KeysForTerm(store, terms[i], counts[i])) {
+      if (!seen_keys.insert(key).second)
+        continue;
+      const KeyEntry* e = store.FindKey(key);
+      if (!e || e->full_cnt == 0)
+        continue;
+      tk.entries.push_back(e);
+      tk.total += e->full_cnt;
     }
-    result.swap(filtered);
+    if (tk.entries.empty())
+      return {};
+    term_keys.push_back(std::move(tk));
+    if (term_keys.back().total < seed_size) {
+      seed_size = term_keys.back().total;
+      seed_index = i;
+    }
   }
+
+  std::vector<uint32_t> result;
+  hash_set<uint32_t> seed_seen;
+
+  for (const KeyEntry* e : term_keys[seed_index].entries) {
+    store.ForEachFull(*e, [&](uint32_t id) {
+      if (!seed_seen.insert(id).second)
+        return true;
+
+      for (size_t i = 0; i < term_keys.size(); ++i) {
+        if (i == seed_index)
+          continue;
+        bool matched = false;
+        for (const KeyEntry* other : term_keys[i].entries) {
+          if (store.FullContains(*other, id)) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched)
+          return true;
+      }
+
+      result.push_back(id);
+      return true;
+    });
+  }
+
   return result;
 }
 
@@ -589,21 +600,29 @@ std::optional<std::vector<std::string>> SubtractCharacter(
     IdsStore& store,
     const std::string& base,
     const std::string& neg,
-    int depth) {
+    int depth,
+    bool from_leaf = false) {
   std::string norm_base = Canon(base);
   std::string norm_neg = Canon(neg);
   if (norm_base == norm_neg)
     return std::vector<std::string>{};
-  if (depth > 3 || AtomicComponents().count(base))
+  // 用户输入/当前项按原始字形判断原子性，保留 龍 等传统复合字的可拆分性；
+  // 递归进入分解叶子时则按归一化字形判断，避免把 辵/⻍ 等变体继续拆成笔画。
+  bool atomic = AtomicComponents().count(base) != 0;
+  if (!atomic && from_leaf)
+    atomic = AtomicComponents().count(norm_base) != 0;
+  if (depth > 3 || atomic)
     return std::nullopt;
 
-  std::vector<std::string> leaves = TopLeavesOfComponent(store, base);
-  if (leaves.size() <= 1 && !leaves.empty() && leaves[0] == norm_base)
+  std::vector<std::string> leaves =
+      TopLeavesOfComponent(store, base, /*preserve_glyph=*/true);
+  if (leaves.size() <= 1 && !leaves.empty() &&
+      Canon(leaves[0]) == norm_base)
     return std::nullopt;
 
-  // 1. 直接叶子命中。
+  // 1. 直接叶子命中。保留原始字形，但比较使用归一化部件。
   for (size_t i = 0; i < leaves.size(); ++i) {
-    if (leaves[i] == norm_neg) {
+    if (Canon(leaves[i]) == norm_neg) {
       leaves.erase(leaves.begin() + static_cast<std::ptrdiff_t>(i));
       return leaves;
     }
@@ -614,7 +633,7 @@ std::optional<std::vector<std::string>> SubtractCharacter(
   bool sub_done = false;
   for (const auto& leaf : leaves) {
     if (!sub_done) {
-      auto sub = SubtractCharacter(store, leaf, norm_neg, depth + 1);
+      auto sub = SubtractCharacter(store, leaf, norm_neg, depth + 1, true);
       if (sub) {
         new_leaves.insert(new_leaves.end(), sub->begin(), sub->end());
         sub_done = true;
@@ -673,6 +692,15 @@ std::vector<uint32_t> PureSubtractionResults(
     size_t pos = 0;
     uint32_t cp = DecodeNext(c, &pos);
     uint32_t id = store.IdOfCp(cp);
+    if (id == kInvalidId) {
+      // 极少数原始字形可能不在字符表中；此时回退到归一化代表字形。
+      const std::string canonical = Canon(c);
+      if (canonical != c) {
+        size_t cpos = 0;
+        cp = DecodeNext(canonical, &cpos);
+        id = store.IdOfCp(cp);
+      }
+    }
     if (id != kInvalidId && seen_id.insert(id).second)
       results.push_back(id);
   }
@@ -743,8 +771,7 @@ std::vector<uint32_t> SearchHybrid(IdsStore& store,
     }
   }
 
-  std::vector<uint32_t> cands = IntersectPostings(
-      store, order, counts, std::max<size_t>(5000, max_results));
+  std::vector<uint32_t> cands = IntersectPostings(store, order, counts);
   if (disabled_blocks) {
     cands.erase(std::remove_if(cands.begin(), cands.end(),
                                [&](uint32_t id) {
