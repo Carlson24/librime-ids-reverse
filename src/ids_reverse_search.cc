@@ -707,43 +707,16 @@ std::vector<uint32_t> PureSubtractionResults(
   return results;
 }
 
-}  // namespace
-
-std::vector<uint32_t> SearchHybrid(IdsStore& store,
-                                   const std::vector<std::string>& components,
-                                   const std::string& mode,
-                                   size_t max_results,
-                                   const rime::hash_set<int>* disabled_blocks) {
-  if (components.empty())
-    return {};
-
-  std::vector<AlgebraStep> steps = ParseAlgebraSteps(components);
-  std::vector<std::string> current;
-  bool pure_sub = true;
-  bool has_sub = false;
-
-  for (const auto& step : steps) {
-    std::string item = NormalizeAlgebraItem(store, step.item, mode);
-    if (item.empty())
-      continue;
-    if (step.op == '+') {
-      if (!current.empty() && has_sub)
-        pure_sub = false;
-      current.push_back(item);
-    } else {
-      has_sub = true;
-      current = ApplySingleSubtraction(store, current, item);
-    }
-  }
-
-  // 纯减法直接返回剩余部件对应的单字。
-  if (pure_sub && has_sub && !current.empty())
-    return PureSubtractionResults(store, current);
-  if (current.empty())
-    return {};
-
+// 按部件叶子列表检索“包含这些部件”的字。
+// 普通多项检索与纯减法后的扩展检索共用，保证两者排序/过滤一致。
+std::vector<uint32_t> SearchByLeaves(
+    IdsStore& store,
+    const std::vector<std::string>& leaves,
+    const std::string& mode,
+    size_t max_results,
+    const rime::hash_set<int>* disabled_blocks) {
   std::vector<std::string> normalized;
-  for (const auto& raw : current) {
+  for (const auto& raw : leaves) {
     std::string n = NormalizeComponent(store, raw, mode);
     if (!n.empty())
       normalized.push_back(n);
@@ -784,6 +757,67 @@ std::vector<uint32_t> SearchHybrid(IdsStore& store,
   if (cands.size() > max_results)
     cands.resize(max_results);
   return cands;
+}
+
+}  // namespace
+
+std::vector<uint32_t> SearchHybrid(IdsStore& store,
+                                   const std::vector<std::string>& components,
+                                   const std::string& mode,
+                                   size_t max_results,
+                                   const rime::hash_set<int>* disabled_blocks) {
+  if (components.empty())
+    return {};
+
+  std::vector<AlgebraStep> steps = ParseAlgebraSteps(components);
+  std::vector<std::string> current;
+  bool pure_sub = true;
+  bool has_sub = false;
+
+  for (const auto& step : steps) {
+    std::string item = NormalizeAlgebraItem(store, step.item, mode);
+    if (item.empty())
+      continue;
+    if (step.op == '+') {
+      if (!current.empty() && has_sub)
+        pure_sub = false;
+      current.push_back(item);
+    } else {
+      has_sub = true;
+      current = ApplySingleSubtraction(store, current, item);
+    }
+  }
+
+  // 纯减法：先给出剩余部件本身，再同步检索包含这些部件的字。
+  // 例如 O达-大：首选 辶，随后列出 边/达/近/连/道 等。
+  if (pure_sub && has_sub && !current.empty()) {
+    std::vector<uint32_t> results = PureSubtractionResults(store, current);
+    std::vector<uint32_t> expanded =
+        SearchByLeaves(store, current, mode, max_results, disabled_blocks);
+
+    hash_set<uint32_t> seen;
+    seen.reserve(results.size() + expanded.size());
+    std::vector<uint32_t> merged;
+    merged.reserve(
+        std::min<size_t>(max_results, results.size() + expanded.size()));
+    for (uint32_t id : results) {
+      if (merged.size() >= max_results)
+        break;
+      if (seen.insert(id).second)
+        merged.push_back(id);
+    }
+    for (uint32_t id : expanded) {
+      if (merged.size() >= max_results)
+        break;
+      if (seen.insert(id).second)
+        merged.push_back(id);
+    }
+    return merged;
+  }
+  if (current.empty())
+    return {};
+
+  return SearchByLeaves(store, current, mode, max_results, disabled_blocks);
 }
 
 std::vector<uint32_t> GetComponentCandidates(IdsStore& store,
