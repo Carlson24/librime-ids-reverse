@@ -199,6 +199,12 @@ bool IdsStore::Parse() {
       case kSecPostBitset:
         post_bitset_ = reinterpret_cast<const uint64_t*>(p);
         break;
+      case kSecVarOff:
+        var_off_ = reinterpret_cast<const uint32_t*>(p);
+        break;
+      case kSecVar:
+        var_ = p;
+        break;
       default:
         break;
     }

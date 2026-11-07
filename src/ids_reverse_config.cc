@@ -111,6 +111,7 @@ void LoadReverseConfig(const rime::Ticket& ticket,
   conf->GetString(ns + "/custom_file", &config->custom_path);
   conf->GetString(ns + "/shuangpin_scheme", &config->shuangpin_scheme);
   conf->GetString(ns + "/ids_format", &config->ids_format);
+  conf->GetString(ns + "/variant_trigger", &config->variant_trigger);
   conf->GetInt(ns + "/max_results", &config->max_results);
 
   if (config->search.prefix.empty())
@@ -133,6 +134,8 @@ void LoadReverseConfig(const rime::Ticket& ticket,
 
   if (config->data_path.empty())
     config->data_path = "ids_data.bin";
+  if (config->variant_trigger.empty())
+    config->variant_trigger = "/";
   if (config->shuangpin_scheme != "zrm" &&
       config->shuangpin_scheme != "quanpin")
     config->shuangpin_scheme = "flypy";

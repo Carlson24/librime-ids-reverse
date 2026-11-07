@@ -46,6 +46,8 @@ enum SectionType {
   kSecPostHead = 13,
   kSecPostSmall = 14,
   kSecPostBitset = 15,
+  kSecVarOff = 16,
+  kSecVar = 17,
 };
 
 // HOT 记录（12 字节）：freq u32, depth u8, block u8, char_token u16, flags
@@ -228,6 +230,17 @@ class IdsStore {
     return kNoToken;
   }
 
+  // 异体字查询：返回 id 对应的变体字 id 数组（无变体时 n=0）。
+  void Variants(uint32_t id, const uint32_t** out, uint16_t* n) const {
+    *n = 0;
+    *out = nullptr;
+    if (!var_ || !var_off_ || id >= num_chars_)
+      return;
+    const uint8_t* p = var_ + var_off_[id];
+    *n = Rd16(p);
+    *out = reinterpret_cast<const uint32_t*>(p + 2);
+  }
+
   // keys / postings
   const rime::hash_map<std::string, KeyEntry>& keys() const { return keys_; }
   const KeyEntry* FindKey(const std::string& k) const {
@@ -300,6 +313,8 @@ class IdsStore {
   const uint32_t* post_head_ = nullptr;
   const uint32_t* post_small_ = nullptr;
   const uint64_t* post_bitset_ = nullptr;
+  const uint32_t* var_off_ = nullptr;
+  const uint8_t* var_ = nullptr;
 
   uint32_t num_chars_ = 0;
   uint32_t max_cp_ = 0;

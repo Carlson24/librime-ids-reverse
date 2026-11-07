@@ -78,6 +78,7 @@ ids_reverse:
   show_unicode: true
   show_block: true
   ids_format: unicode            # unicode | bracket | plain
+  variant_trigger: "/"           # O 模式异体字查询触发符，可自定义
   # disabled_blocks: [扩A, 扩展B]
 
   search_prefix: "I"
@@ -132,6 +133,10 @@ ids_reverse:
 - `Ctrl+Enter` / `Alt+Enter` / `Alt+I` / `Ctrl+Shift+I`：上屏当前候选的 IDS 结构。
 - `Ctrl+1~6` / `Alt+1~6`：上屏指定序号候选的 IDS 结构。
 - `7/8/9/0`、方向键、PageUp/PageDown、逗号、句号放行给原有按键绑定。
+- `/`（触发符，可通过 `variant_trigger` 自定义）：**异体字查询**。以菜单当前选中
+  候选为基准，从 `ids_variants.txt` 编译进 `ids_data.bin` 的变体表中查询其异体字。
+  例如 `O艹亏` 首选 `芌`，按 `/` 显示其异体字 `芋`；`O艹于` 首选 `芋`，按 `/`
+  显示 `芌 芋`。无变体时显示 `〔无异体字〕` 提示候选（选中即上屏基准字）。
 - 使用 `hybrid_prefix`、`hybrid_tag`、`hybrid_tips`。
 
 O 模式自带的部件候选来自 `ids_data.bin`，因此即使当前方案没有拼音词典，也可以完成
@@ -161,6 +166,7 @@ patch:
     show_unicode: true
     show_block: true
     ids_format: unicode
+    variant_trigger: "/"
     search_prefix: "I"
     search_tag: ids_reverse_search
     search_tips: "〔部件检字〕"
@@ -190,6 +196,7 @@ python3 generate_data_v2.py    # 依赖 pypinyin
 - `ids_lv1.txt`
 - `EquivalentUnifiedIdeograph.txt`
 - `excel_sheet2_pinyin.json`（部件读音补充表）
+- `ids_variants.txt`（异体字表，`原始汉字\t异体字（空格分隔）`）
 - `wanxiang_charset.dict.yaml`（可选的本地字符集来源，不存在则跳过）
 
 产出 `ids_data.bin`。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
@@ -247,6 +254,8 @@ O 模式：
 - `O泰-氺+日` → `春`
 - `O森-木+氵` → `淋`
 - `O森-木+氵-氵` → 多步交替运算
+- `O艹亏` → `芌`，按 `/` → 显示异体字 `芋`
+- `O艹于` → `芋`，按 `/` → 显示异体字 `芌 芋`
 - `Omu` + 回车 → 以 `mu` 作为部件继续检字
 - `Ctrl+Enter` → 上屏当前候选 IDS
 

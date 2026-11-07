@@ -77,6 +77,27 @@ def dump_ids3(bin_path, output_path=None, sample_count=None):
         line = f"{char_str}\tU+{cp:04X}\t{py_str}\t{ids_str}\t{block_name}\t{depth}\t{freq}"
         lines.append(line)
 
+    # 异体字 section (16: VAR_OFF, 17: VAR)，存在则反解导出
+    if 16 in sections and 17 in sections:
+        var_off_off, _ = sections[16]
+        var_off, var_len = sections[17]
+        var_offsets = struct.unpack(f'<{num_chars}I', blob[var_off_off: var_off_off + num_chars * 4])
+        var_lines = []
+        for vid in range(num_chars):
+            p = var_off + var_offsets[vid]
+            if p + 2 > var_off + var_len:
+                break
+            cnt = struct.unpack('<H', blob[p: p + 2])[0]
+            if cnt == 0:
+                continue
+            variants = struct.unpack(f'<{cnt}I', blob[p + 2: p + 2 + cnt * 4])
+            vchars = ' '.join(chr(id2cp[v]) for v in variants if v < num_chars)
+            var_lines.append(f"{chr(id2cp[vid])}\t{vchars}")
+        vout = "ids_variants_dumped.txt"
+        with open(vout, 'w', encoding='utf-8') as out:
+            out.write("# 原字\t异体字列表 (空格分隔)\n" + '\n'.join(var_lines) + '\n')
+        print(f"[Variants] {len(var_lines)} base chars exported to {vout}")
+
     if output_path:
         with open(output_path, 'w', encoding='utf-8') as out:
             out.write('\n'.join(lines) + '\n')

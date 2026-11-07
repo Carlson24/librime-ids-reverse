@@ -18,6 +18,7 @@ ZITOOLS_LV2_PATH = "ids_zitools.txt"
 ZITOOLS_LV1_PATH = "ids_lv1.txt"
 EQUIVALENT_UNIFIED_PATH = "EquivalentUnifiedIdeograph.txt"
 CHARSET_PATH = "wanxiang_charset.dict.yaml"
+VARIANTS_PATH = "ids_variants.txt"
 OUTPUT_INDEX = "ids_index.txt"
 OUTPUT_META = "ids_meta.txt"
 
@@ -1211,6 +1212,45 @@ def main():
         COLD += struct.pack('<H', len(py_bytes)); COLD += py_bytes
         COLD += struct.pack('<H', len(ids_bytes)); COLD += ids_bytes
 
+    # ---- VARIANTS (异体字映射) ----
+    # 每字一条记录: u16 count + count × u32 (变体字 id)，无变体字 count=0。
+    VAR_OFF = [0] * N
+    VAR = bytearray()
+    variant_lists = {}  # base_cp -> [variant ids，按文件顺序去重]
+    if os.path.exists(VARIANTS_PATH):
+        with open(VARIANTS_PATH, 'r', encoding='utf-8') as vf:
+            for line in vf:
+                line = line.strip()
+                if not line or line.startswith('#') or '\t' not in line:
+                    continue
+                base, vars_str = line.split('\t', 1)
+                if len(base) != 1 or ord(base) not in id_of_cp:
+                    continue
+                seen = set()
+                ids = []
+                for v in vars_str.split():
+                    if len(v) != 1:
+                        continue
+                    vcp = ord(v)
+                    if vcp == ord(base) or vcp not in id_of_cp:
+                        continue
+                    vid = id_of_cp[vcp]
+                    if vid not in seen:
+                        seen.add(vid)
+                        ids.append(vid)
+                if ids:
+                    variant_lists[ord(base)] = ids
+        print(f"Variants: {len(variant_lists)} base chars, "
+              f"{sum(len(v) for v in variant_lists.values())} variant relations.")
+    else:
+        print(f"[Warning] {VARIANTS_PATH} not found, variants section empty.")
+    for i, cp in enumerate(chars):
+        VAR_OFF[i] = len(VAR)
+        ids = variant_lists.get(cp, [])
+        VAR += struct.pack('<H', len(ids))
+        for vid in ids:
+            VAR += struct.pack('<I', vid)
+
     # ---- CP2ID / ID2CP ----
     CP2ID = bytearray(MAX_CP * 4)
     for cp, i in id_of_cp.items():
@@ -1282,6 +1322,7 @@ def main():
     rec_off_blob = b''.join(struct.pack('<I', x) for x in ALTS_OFF)
     cs_off_blob = b''.join(struct.pack('<I', x) for x in CS_OFF)
     cold_off_blob = b''.join(struct.pack('<I', x) for x in COLD_OFF)
+    var_off_blob = b''.join(struct.pack('<I', x) for x in VAR_OFF)
 
     # section type ids must match src/ids_store.h
     sections = [
@@ -1291,6 +1332,7 @@ def main():
         (8, cold_off_blob), (9, bytes(COLD)),
         (10, bytes(TB)), (11, bytes(PB)), (12, bytes(KB)),
         (13, bytes(HEAD)), (14, bytes(SMALL)), (15, bytes(BITS)),
+        (16, var_off_blob), (17, bytes(VAR)),
     ]
 
     header_size = 32

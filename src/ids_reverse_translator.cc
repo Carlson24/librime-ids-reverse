@@ -1763,6 +1763,57 @@ void IdsReverseTranslator::BuildComponentCandidates(
   }
 }
 
+void IdsReverseTranslator::BuildVariantCandidates(
+    IdsStore& store,
+    uint32_t base_id,
+    const std::string& base,
+    const rime::Segment& segment,
+    rime::FifoTranslation* translation) {
+  bool show_pinyin = config_.show_pinyin;
+  bool show_ids = config_.show_ids;
+  bool show_unicode = config_.show_unicode;
+  bool show_block = config_.show_block;
+  rime::Context* ctx = engine_ ? engine_->context() : nullptr;
+  if (ctx) {
+    if (config_.has_sw_pinyin)
+      show_pinyin = ctx->get_option("show_pinyin");
+    if (config_.has_sw_ids)
+      show_ids = ctx->get_option("show_ids");
+    if (config_.has_sw_unicode)
+      show_unicode = ctx->get_option("show_unicode");
+    if (config_.has_sw_block)
+      show_block = ctx->get_option("show_block");
+  }
+
+  const uint32_t* variants = nullptr;
+  uint16_t n = 0;
+  if (base_id != kInvalidId)
+    store.Variants(base_id, &variants, &n);
+
+  if (n == 0) {
+    // 无异体字：提示候选，text 为基准字，选中即上屏。
+    auto cand = rime::New<rime::SimpleCandidate>(
+        "ids_reverse", segment.start, segment.end, base, "〔无异体字〕", "/\t");
+    cand->set_quality(100.0);
+    translation->Append(cand);
+    return;
+  }
+
+  for (uint16_t i = 0; i < n; ++i) {
+    uint32_t vid = variants[i];
+    if (vid >= store.num_chars())
+      continue;
+    std::string text = CpToUtf8(store.CpOfId(vid));
+    std::string comment =
+        BuildComment(store, vid, show_pinyin, show_ids, show_unicode,
+                     show_block, config_.ids_format);
+    auto cand = rime::New<rime::SimpleCandidate>(
+        "ids_reverse", segment.start, segment.end, text, comment, "/\t");
+    cand->set_quality(100.0);
+    translation->Append(cand);
+  }
+}
+
 rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
     const rime::Segment& segment) {
   rime::Context* ctx = engine_ ? engine_->context() : nullptr;
@@ -1780,8 +1831,16 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
   auto translation = rime::New<rime::FifoTranslation>();
   const std::string& pending = st.pending;
 
-  if ((pending.empty() || pending == "-" || pending == "+") &&
-      !st.components.empty()) {
+  if (pending == config_.variant_trigger && !st.components.empty()) {
+    // 异体字查询：基准字由 processor 写入 property。
+    std::string base = ctx->get_property(kVariantsProperty);
+    if (!base.empty()) {
+      uint32_t cp = CpOf(base);
+      uint32_t base_id = cp ? store.IdOfCp(cp) : kInvalidId;
+      BuildVariantCandidates(store, base_id, base, segment, translation.get());
+    }
+  } else if ((pending.empty() || pending == "-" || pending == "+") &&
+             !st.components.empty()) {
     std::vector<uint32_t> results = SearchHybrid(
         store, st.components, PinyinMode(), config_.max_results,
         config_.disabled_blocks_enabled ? &config_.disabled_blocks : nullptr);

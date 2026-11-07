@@ -53,6 +53,11 @@ class IdsReverseTranslator : public rime::Translator {
                                 const std::vector<uint32_t>& results,
                                 const rime::Segment& segment,
                                 rime::FifoTranslation* translation);
+  void BuildVariantCandidates(IdsStore& store,
+                              uint32_t base_id,
+                              const std::string& base,
+                              const rime::Segment& segment,
+                              rime::FifoTranslation* translation);
 
   ReverseConfig config_;
   std::string name_space_;

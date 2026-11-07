@@ -93,6 +93,7 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
 
   if (selected_is_result_) {
     engine_->CommitText(selected_text_);
+    ctx->set_property(kVariantsProperty, "");
     ctx->Clear();
   } else {
     HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
@@ -235,6 +236,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   }
 
   if (code == XK_Escape || repr == "Escape") {
+    ctx->set_property(kVariantsProperty, "");
     ctx->Clear();
     return rime::kAccepted;
   }
@@ -315,11 +317,35 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
 
   bool is_letter = !ctrl && !alt && repr.size() == 1 &&
                    std::isalpha(static_cast<unsigned char>(repr[0]));
+  bool is_variant = !ctrl && !alt &&
+                    (code == XK_slash || repr == "/" || repr == "slash");
   bool is_minus =
       !ctrl && !alt && (code == XK_minus || repr == "minus" || repr == "-");
   bool is_plus = !ctrl && !alt &&
                  (code == XK_plus || code == XK_equal || repr == "plus" ||
                   repr == "equal" || repr == "+" || repr == "=");
+
+  if (is_variant) {
+    // 异体字触发：以菜单当前选中候选为基准，写入 property 后推入触发符驱动重译。
+    if (!ctx->HasMenu() || ctx->composition().empty())
+      return rime::kNoop;
+    Segment& seg = ctx->composition().back();
+    if (!seg.menu)
+      return rime::kNoop;
+    size_t index = seg.selected_index;
+    seg.menu->Prepare(index + 1);
+    an<Candidate> cand = seg.GetCandidateAt(index);
+    if (!cand || cand->text().empty())
+      return rime::kNoop;
+    an<Candidate> genuine = Candidate::GetGenuineCandidate(cand);
+    const std::string& type = genuine ? genuine->type() : cand->type();
+    if (type != "ids_reverse" && type != "hanzi_result")
+      return rime::kNoop;
+    ctx->set_property(kVariantsProperty,
+                      genuine ? genuine->text() : cand->text());
+    ctx->PushInput(config_.variant_trigger);
+    return rime::kAccepted;
+  }
 
   if (is_letter || is_minus || is_plus) {
     char ch = is_minus ? '-' : (is_plus ? '+' : repr[0]);

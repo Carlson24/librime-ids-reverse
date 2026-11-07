@@ -32,6 +32,7 @@ struct ReverseConfig {
   std::string custom_path;
   std::string shuangpin_scheme = "flypy";
   std::string ids_format = "unicode";
+  std::string variant_trigger = "/";
   int max_results = 60;
   bool show_pinyin = true;
   bool show_ids = true;
@@ -47,6 +48,8 @@ struct ReverseConfig {
 
 // 混合检字过程中保存在 Context property 中的状态。
 constexpr char kHybridStateProperty[] = "ids_reverse_components";
+// 异体字查询的基准字（/ 触发时由 processor 写入，translator 读取）。
+constexpr char kVariantsProperty[] = "ids_reverse_variants";
 // 混合检字结果段使用的内部标签（与可配置 tag 区分）。
 constexpr char kResultSegmentTag[] = "ids_reverse_result";
 
