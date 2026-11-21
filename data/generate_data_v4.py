@@ -1044,7 +1044,7 @@ def main():
             f.write(f"{ch}\t{py_display}\t{clean_seq}\t{u_code}\t{block}\t{keys_str}\t{tot_comps}\t{freq_score}\n")
             meta_records.append((cp, freq_score, block_id, tot_comps, py_display, clean_seq, keys_str))
 
-    print("Step 8: Building IDS3 single-file data (ids_data.bin)...")
+    print("Step 8: Building IDS4 single-file data (ids_data.bin)...")
     import struct
 
     # ---- C2 canon: identical to the runtime CanonMap in src/ids_store.cc ----
@@ -1114,24 +1114,23 @@ def main():
             h ^= (t >> 8) & 0xFF; h = (h * 16777619) & 0xFFFFFFFF
         return h
 
-    # ---- token vocabulary ----
-    token_set = set()
-    for k in sorted_inverted.keys():
-        token_set.add(k.split('*')[0])
-    for py, comps in pinyin_to_comps.items():
-        for c in comps:
-            token_set.add(c)
-    for rec in meta_records:
-        for var in rec[6].split('|'):
-            for c in var.split(','):
-                if c:
-                    token_set.add(c)
-    for s in list(token_set):
-        token_set.add(C2of(s))
-    tokens = sorted(token_set)
-    tok_id = {t: i for i, t in enumerate(tokens)}
-    NT = len(tokens)
-    assert NT <= 65534, NT
+    # ---- runtime AtomicComponents()，必须逐字一致 ----
+    ATOMIC_COMPONENTS = {
+        "木", "氵", "水", "火", "灬", "土", "金", "钅", "日", "月", "目", "口",
+        "人", "亻", "手", "扌", "心", "忄", "女", "子", "艹", "言", "讠", "石",
+        "田", "山", "刀", "刂", "力", "又", "十", "大", "小", "工", "弓", "广",
+        "门", "马", "鸟", "鱼", "虫", "犭", "犬", "辶", "宀", "冖", "穴", "竹",
+        "⺮", "米", "糸", "纟", "车", "足", "⻊", "雨", "页", "酉", "贝", "走",
+        "身", "辛", "辰", "邑", "阝", "阜", "方", "斤", "止", "歹", "殳", "毛",
+        "氏", "气", "白", "皮", "皿", "矢", "示", "礻", "禾", "立", "羽", "舟",
+        "艮", "见", "角", "谷", "豆", "豕", "豸", "赤", "革", "音", "风", "飞",
+        "食", "饣", "首", "香", "骨", "鬼", "黾", "鼎", "鼓", "鼠", "鼻", "齐",
+        "齿", "龙", "龟",
+        # Canon() 归一后的代表字形
+        "⺡", "⺣", "⺅", "龵", "⺖", "⺾", "⺬", "⺭", "⻐", "⻠", "⺰", "⺲",
+        "⻌", "⻖", "⺩", "⺙", "⺹", "⻊", "⺫", "⺮", "⺉", "⺶", "㇒", "㇐",
+        "㇑", "㇔", "㇏", "㇀", "乛", "亅",
+    }
 
     # ---- dense char id space ----
     MAX_CP = 0x33500
@@ -1150,13 +1149,92 @@ def main():
     N = len(chars)
     id_of_cp = {cp: i for i, cp in enumerate(chars)}
 
-    # ---- per-char ALTS / COMPSET / COLD + HOT ----
-    HOT = bytearray()
-    ALTS_OFF = [0] * N
+    # ---- 预计算顶层叶子 / 原子部件（与运行时语义一致）----
+    primary_ids = {}
+    for cp in chars:
+        rec = meta_by_cp.get(cp)
+        primary_ids[cp] = rec[5] if rec is not None else ""
+
+    leaves_orig = {}    # cp -> [原始字形]
+    leaves_canon = {}   # cp -> [Canon 后字形]
+    for cp in chars:
+        raw = [c for c in primary_ids.get(cp, "")
+               if not (0x2FF0 <= ord(c) <= 0x2FFB)]
+        if not raw:
+            raw = [chr(cp)]
+        leaves_orig[cp] = raw
+        leaves_canon[cp] = [C2of(c) for c in raw]
+
+    def top_leaves_canon(c):
+        cp = ord(c)
+        cid = id_of_cp.get(cp)
+        if cid is None:
+            return [c]
+        lv = leaves_canon.get(cp)
+        if not lv:
+            return [c]
+        return lv
+
+    # 与运行时 AtomicDecomposition 的“每顶层字符一份 cache”语义一致。
+    def atom_decomp_top(cp):
+        cache = {}
+
+        def rec(c, depth):
+            if c in cache:
+                return cache[c]
+            if depth > 2 or c in ATOMIC_COMPONENTS:
+                r = [c]
+                cache[c] = r
+                return r
+            lv = top_leaves_canon(c)
+            if len(lv) <= 1:
+                r = [c]
+                cache[c] = r
+                return r
+            out = []
+            for leaf in lv:
+                if leaf == c:
+                    out.append(leaf)
+                else:
+                    out.extend(rec(leaf, depth + 1))
+            cache[c] = out
+            return out
+
+        return rec(C2of(chr(cp)), 0)
+
+    atoms_by_cp = {}
+    for cp in chars:
+        atoms_by_cp[cp] = atom_decomp_top(cp)
+
+    # ---- token vocabulary（包含预计算叶子/原子用到的全部字形）----
+    token_set = set()
+    for k in sorted_inverted.keys():
+        token_set.add(k.split('*')[0])
+    for py, comps in pinyin_to_comps.items():
+        for c in comps:
+            token_set.add(c)
+    for rec in meta_records:
+        for var in rec[6].split('|'):
+            for c in var.split(','):
+                if c:
+                    token_set.add(c)
+    for cp in chars:
+        token_set.update(leaves_orig[cp])
+        token_set.update(atoms_by_cp[cp])
+    for s in list(token_set):
+        token_set.add(C2of(s))
+    tokens = sorted(token_set)
+    tok_id = {t: i for i, t in enumerate(tokens)}
+    NT = len(tokens)
+    assert NT <= 65534, NT
+
+    # ---- per-char ALTS / LEAVES / ATOMS / COMPSET / COLD + CHAR ----
+    CHAR = bytearray()
+    COLD_IDX = bytearray()
     ALTS = bytearray()
-    CS_OFF = [0] * N
+    LEAVES = bytearray()
+    ATOMS = bytearray()
     CS = bytearray()
-    COLD_OFF = [0] * N
     COLD = bytearray()
     for i, cp in enumerate(chars):
         rec = meta_by_cp.get(cp)
@@ -1187,8 +1265,8 @@ def main():
         comp_sorted = sorted({t for tv in variants for t in tv})
         ch_str = chr(cp)
         ctok = tok_id.get(ch_str, tok_id.get(C2of(ch_str), 65535))
-        HOT += struct.pack('<IBBHI', freq_score, depth & 0xFF, block_id & 0xFF, ctok, len_mask)
 
+        alts_off = len(ALTS)
         ab = bytearray()
         glens = sorted(groups.keys())
         ab.append(len(glens) & 0xFF)
@@ -1200,23 +1278,50 @@ def main():
                 for t in tv:
                     ab += struct.pack('<H', t)
                 ab += struct.pack('<I', fnv32(tv))
-        ALTS_OFF[i] = len(ALTS)
         ALTS += ab
 
-        CS_OFF[i] = len(CS)
+        # LEAVES: u16 n + u16 token[n]；记录 2 字节对齐
+        leaf_tokens = [tok_id[c] for c in leaves_orig[cp]]
+        leaf_off = len(LEAVES)
+        LEAVES += struct.pack('<H', len(leaf_tokens))
+        for t in leaf_tokens:
+            LEAVES += struct.pack('<H', t)
+        if len(LEAVES) & 1:
+            LEAVES.append(0)
+
+        # ATOMS: u16 n + u16 token[n]，保持 AtomicDecomposition 的顺序
+        atom_tokens = [tok_id[c] for c in atoms_by_cp[cp]]
+        atom_off = len(ATOMS)
+        ATOMS += struct.pack('<H', len(atom_tokens))
+        for t in atom_tokens:
+            ATOMS += struct.pack('<H', t)
+        if len(ATOMS) & 1:
+            ATOMS.append(0)
+
+        cs_off = len(CS)
         CS += struct.pack('<H', len(comp_sorted))
         for t in comp_sorted:
             CS += struct.pack('<H', t)
 
-        COLD_OFF[i] = len(COLD)
+        cold_off = len(COLD)
         COLD += struct.pack('<H', len(py_bytes)); COLD += py_bytes
         COLD += struct.pack('<H', len(ids_bytes)); COLD += ids_bytes
 
+        CHAR += struct.pack('<IIHBBIII',
+                            freq_score & 0xFFFFFFFF,
+                            len_mask & 0xFFFFFFFF,
+                            ctok,
+                            depth & 0xFF,
+                            block_id & 0xFF,
+                            alts_off,
+                            leaf_off,
+                            atom_off)
+        COLD_IDX += struct.pack('<II', cs_off, cold_off)
+
     # ---- VARIANTS (异体字映射) ----
-    # 每字一条记录: u16 count + count × u32 (变体字 id)，无变体字 count=0。
     VAR_OFF = [0] * N
     VAR = bytearray()
-    variant_lists = {}  # base_cp -> [variant ids，按文件顺序去重]
+    variant_lists = {}
     if os.path.exists(VARIANTS_PATH):
         with open(VARIANTS_PATH, 'r', encoding='utf-8') as vf:
             for line in vf:
@@ -1257,13 +1362,22 @@ def main():
         struct.pack_into('<I', CP2ID, cp * 4, i + 1)
     ID2CP = b''.join(struct.pack('<I', cp) for cp in chars)
 
-    # ---- TOKENS ----
+    # ---- TOKENS / TOK_CANON / ATOMIC_SET ----
     TB = bytearray()
     TB += struct.pack('<H', NT)
     for t in tokens:
         bs = t.encode('utf-8')
         TB += struct.pack('<H', len(bs)); TB += bs
         TB += struct.pack('<I', ord(t) if len(t) == 1 else 0)
+    TOK_CANON = bytearray()
+    for t in tokens:
+        c = C2of(t)
+        TOK_CANON += struct.pack('<H', tok_id.get(c, tok_id[t]))
+    atomic_ids = sorted({tok_id[c] for c in ATOMIC_COMPONENTS if c in tok_id})
+    AS = bytearray()
+    AS += struct.pack('<H', len(atomic_ids))
+    for t in atomic_ids:
+        AS += struct.pack('<H', t)
 
     # ---- PY ----
     py_items = sorted(pinyin_to_comps.items())
@@ -1284,55 +1398,76 @@ def main():
         for t in ids:
             PB += struct.pack('<H', t)
 
-    # ---- KEYS + postings ----
+    # ---- KEY_LOOKUP / KEY_REC / POST ----
     K = 1024
-    bitset_words = (N + 63) // 64
-    HEAD = bytearray()
-    SMALL = bytearray()
-    BITS = bytearray()
-    key_entries = []
+    BITSET_BYTES = ((N + 63) // 64) * 8
+    POST = bytearray()
+
+    def align8():
+        while len(POST) % 8:
+            POST.append(0)
+
+    by_token = {}
     for key in sorted(sorted_inverted.keys()):
+        base = key
+        mult = 1
+        if '*' in key:
+            base, m = key.rsplit('*', 1)
+            try:
+                mult = int(m)
+            except ValueError:
+                continue
+        if base not in tok_id:
+            continue
         ids = [id_of_cp[ord(ch)] for ch in sorted_inverted[key] if ord(ch) in id_of_cp]
         cnt = len(ids)
         head_ids = ids[:K]
-        head_off = len(HEAD) // 4
+        align8()
+        head_off = len(POST)
         for x in head_ids:
-            HEAD += struct.pack('<I', x)
-        if cnt * 4 > bitset_words * 8:
-            kind = 1
-            words = [0] * bitset_words
+            POST += struct.pack('<I', x)
+        kind = 1 if cnt > K else 0
+        align8()
+        full_off = len(POST)
+        if kind == 0:
+            for x in sorted(ids):
+                POST += struct.pack('<I', x)
+        else:
+            words = [0] * (BITSET_BYTES // 8)
             for x in ids:
                 words[x >> 6] |= (1 << (x & 63))
-            full_off = len(BITS) // 8
             for w in words:
-                BITS += struct.pack('<Q', w)
-        else:
-            kind = 0
-            full_off = len(SMALL) // 4
-            for x in sorted(ids):
-                SMALL += struct.pack('<I', x)
-        key_entries.append((key.encode('utf-8'), head_off, len(head_ids), full_off, cnt, kind))
+                POST += struct.pack('<Q', w)
+        by_token.setdefault(tok_id[base], []).append(
+            (mult, head_off, len(head_ids), full_off, cnt, kind))
 
-    KB = bytearray()
-    KB += struct.pack('<I', len(key_entries))
-    for kb, ho, hc, fo, fc, kind in key_entries:
-        KB += struct.pack('<H', len(kb)); KB += kb
-        KB += struct.pack('<IIIIB', ho, hc, fo, fc, kind)
+    KEY_LOOKUP = [0] * (NT + 1)
+    KEY_REC = bytearray()
+    for t in range(NT):
+        KEY_LOOKUP[t] = len(KEY_REC) // 20
+        for mult, head_off, head_cnt, full_off, full_cnt, kind in sorted(
+                by_token.get(t, []), key=lambda x: x[0]):
+            KEY_REC += struct.pack('<BBHIIII', mult & 0xFF, kind & 0xFF, 0,
+                                   head_off, head_cnt, full_off, full_cnt)
+    KEY_LOOKUP[NT] = len(KEY_REC) // 20
 
-    rec_off_blob = b''.join(struct.pack('<I', x) for x in ALTS_OFF)
-    cs_off_blob = b''.join(struct.pack('<I', x) for x in CS_OFF)
-    cold_off_blob = b''.join(struct.pack('<I', x) for x in COLD_OFF)
-    var_off_blob = b''.join(struct.pack('<I', x) for x in VAR_OFF)
+    KL = b''.join(struct.pack('<I', x) for x in KEY_LOOKUP)
+    CANON = bytes(TOK_CANON)
+    VAR_OFF_BLOB = b''.join(struct.pack('<I', x) for x in VAR_OFF)
 
-    # section type ids must match src/ids_store.h
+    # 节区按“冷热”排列：热数据在前，减少首次查询触页跨度。
+    # section type ids 必须与 src/ids_store.h 一致。
     sections = [
-        (1, bytes(CP2ID)), (2, ID2CP), (3, bytes(HOT)),
-        (4, rec_off_blob), (5, bytes(ALTS)),
-        (6, cs_off_blob), (7, bytes(CS)),
-        (8, cold_off_blob), (9, bytes(COLD)),
-        (10, bytes(TB)), (11, bytes(PB)), (12, bytes(KB)),
-        (13, bytes(HEAD)), (14, bytes(SMALL)), (15, bytes(BITS)),
-        (16, var_off_blob), (17, bytes(VAR)),
+        (3, bytes(CHAR)), (1, bytes(CP2ID)),
+        (12, KL), (13, bytes(KEY_REC)),
+        (10, bytes(TB)), (17, CANON), (18, bytes(AS)), (11, bytes(PB)),
+        (6, bytes(LEAVES)), (7, bytes(ATOMS)),
+        (5, bytes(ALTS)), (8, bytes(CS)),
+        (14, bytes(POST)),
+        (4, bytes(COLD_IDX)), (9, bytes(COLD)),
+        (15, VAR_OFF_BLOB),
+        (16, bytes(VAR)),
+        (2, ID2CP),
     ]
 
     header_size = 32
@@ -1345,8 +1480,8 @@ def main():
         table += struct.pack('<IIQQ', sec_type, 0, offset, len(data))
         blobs.append((offset, data))
         offset += len(data)
-    header = struct.pack('<4sHHIIIIII', b'IDS3', 1, 0, MAX_CP, N, len(key_entries),
-                         len(sections), 0, 0)
+    header = struct.pack('<4sHHIIIIII', b'IDS4', 1, 0, MAX_CP, N,
+                         len(KEY_REC) // 20, len(sections), 0, 0)
 
     out = "ids_data.bin"
     with open(out, 'wb') as f:
@@ -1364,10 +1499,10 @@ def main():
     assert len(header) == 32
     assert len(table) == table_size
     assert N == len(chars)
-    print("IDS3 self-check passed.")
-    print(f"chars={N} tokens={NT} keys={len(key_entries)} "
-          f"head_ids={len(HEAD)//4} small={len(SMALL)//4} big={len(BITS)//(8*bitset_words)}")
-    print(f"IDS3 file size: {os.path.getsize(out) / 1024 / 1024:.2f} MB")
+    print("IDS4 self-check passed.")
+    print(f"chars={N} tokens={NT} keys={len(KEY_REC) // 20} "
+          f"post={len(POST)} leaves={len(LEAVES)} atoms={len(ATOMS)}")
+    print(f"IDS4 file size: {os.path.getsize(out) / 1024 / 1024:.2f} MB")
     print(f"Index text size: {os.path.getsize(OUTPUT_INDEX) / 1024 / 1024:.2f} MB")
     print(f"Meta text size: {os.path.getsize(OUTPUT_META) / 1024 / 1024:.2f} MB")
 

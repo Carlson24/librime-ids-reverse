@@ -1,5 +1,5 @@
 //
-// ids_reverse_translator.cc — ids_reverse 统一检字翻译器（C++，IDS3
+// ids_reverse_translator.cc — ids_reverse 统一检字翻译器（C++，IDS4
 // 数据格式，面向查询延迟）。
 //
 #include "ids_reverse_translator.h"

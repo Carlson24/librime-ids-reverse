@@ -11,20 +11,31 @@ O 模式为**插件自包含实现**，不需要 Lua，也不依赖任何外部�
 
 ---
 
-## 数据格式（IDS3）
+## 数据格式（IDS4）
 
-单文件 `ids_data.bin`（约 24MB），面向查询延迟设计：`mmap` 惰性映射、稠密字 id、
-整数部件匹配、位图/有序数组倒排、生成期预算的 tier 提示。
+单文件 `ids_data.bin`（约 29MB），面向**查询延迟**设计：`mmap` 惰性映射、
+稠密字 id、整数部件匹配、预计算叶子/原子部件、整数倒排键、每键连续 postings。
 
 - **稠密 id**：103k+ 汉字映射到 `0..N-1`（`CP2ID`/`ID2CP`）。
-- **HOT**：按 id 直索引 `{freq, depth, block, char_token, flags}`。
-- **整数部件匹配**：14k+ 部件 token 表（`u16`）；alts 存成按长度分组的平坦 `u16` 序列 +
-  每变体 `u32` 有序签名。
-- **倒排**：每 key 存字频序 top-1024 热头；完整集合大 key 用**位图**、小 key 用
-  **id 升序 `u32`**；多项交集用位图 AND / 双指针归并。
-- **PY/TOKENS/KEYS**：拼音→token、token 词表、倒排键表。
+- **CHAR**：每字 24 字节定长记录 `{freq, flags, char_token, depth, block,
+  alts_off, leaf_off, atom_off}`，一次 cache line 读取评分所需全部热字段。
+- **整数部件匹配**：15k+ 部件 token 表（`u16`）；alts 存成按长度分组的平坦
+  `u16` 序列 + 每变体 `u32` 有序签名。
+- **预计算派生数据**：
+  - `LEAVES`：每字顶层部件 token 序列，替代运行时 UTF-8 IDS 拆字；
+  - `ATOMS`：每字原子部件 token 序列，替代运行时 `std::map<string,int>` 分解；
+  - `TOK_CANON`：token → 归一化 token 直查表；
+  - `ATOMIC_SET`：原子部件 token 集合，生成器与运行时共用。
+- **倒排**：
+  - `KEY_LOOKUP`/`KEY_REC`：按 `token_id + 重数` 直接寻址，不再哈希字符串键；
+  - `POST`：每个键的 `head` 与完整集合连续存放；完整集合大键用**位图**、
+    其余用 id 升序 `u32`；位图阈值 `>1024`。
+  - 单 term 查询直接使用字频序 `head`，不再遍历十万级完整倒排。
+- **PY/TOKENS**：拼音→token、token 词表（含码点）。
 
-区间（section）采用节表，全部定长、小端、8 字节对齐。
+区间（section）采用节表，全部定长、小端、8 字节对齐，并按冷热排序：
+`CHAR → CP2ID → KEY_* → TOKENS → LEAVES/ATOMS → ALTS/COMPSET → POST →
+COLD → VAR → ID2CP`。
 
 ---
 
@@ -227,12 +238,15 @@ python3 generate_data_v2.py    # 依赖 pypinyin
 - `ids_variants.txt`（异体字表，`原始汉字\t异体字（空格分隔）`）
 - `wanxiang_charset.dict.yaml`（可选的本地字符集来源，不存在则跳过）
 
-产出 `ids_data.bin`。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
+产出 `ids_data.bin`（IDS4，约 29MB）。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
+
+> IDS4 与旧 IDS3 数据文件不兼容。升级插件后必须重新生成 `ids_data.bin`；
+> 读取到旧 magic 时会直接加载失败。
 
 数据检查：
 
 ```sh
-python3 dump_ids3.py ids_data.bin
+python3 dump_ids4.py ids_data.bin
 ```
 
 ---
@@ -298,12 +312,15 @@ O 模式：
 
 性能目标：单字查询 <0.1ms、多项查询 <1ms。
 
+IDS4 开发机基准（1,278 条单部件/双部件/加减查询混合，含冷热数据）：
+旧实现约 0.50–0.57 ms/条，IDS4 约 0.058 ms/条（约 9×）。
+
 ---
 
 ## 备注
 
 - O 模式已完全由 C++ 实现，不再需要 `ids_dict.bin` / `ids_offset.bin` /
   `ids_info.bin` / `ids_info_idx.bin`，也不再需要 Lua 组件。
-- `ids_search.lua` 与 `ids_page_processor.lua` 为历史文件，不再与 IDS3 磁盘格式对应
+- `ids_search.lua` 与 `ids_page_processor.lua` 为历史文件，不再与 IDS4 磁盘格式对应
   （`ids_page_processor.lua` 仍可用于翻页键处理）。
 - `data/ids_custom.txt` 是可选的自定义读音/禁用分区示例，默认不启用任何规则。

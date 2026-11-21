@@ -194,20 +194,14 @@ std::vector<std::string> TopLeavesById(IdsStore& store,
   std::vector<std::string> leaves;
   if (id == kInvalidId)
     return leaves;
-  const uint8_t* py = nullptr;
-  const uint8_t* ids = nullptr;
-  uint16_t py_len = 0;
-  uint16_t ids_len = 0;
-  store.Cold(id, &py, &py_len, &ids, &ids_len);
-  if (ids_len > 0) {
-    std::string raw(reinterpret_cast<const char*>(ids), ids_len);
-    for (const auto& ch : Utf8Chars(raw)) {
-      size_t pos = 0;
-      uint32_t cp = DecodeNext(ch, &pos);
-      if (IsIdc(cp))
-        continue;
-      leaves.push_back(preserve_glyph ? ch : Canon(ch));
-    }
+  const uint16_t* tokens = nullptr;
+  uint16_t n = 0;
+  store.Leaves(id, &tokens, &n);
+  for (uint16_t i = 0; i < n; ++i) {
+    uint16_t t = preserve_glyph ? tokens[i] : store.CanonToken(tokens[i]);
+    const std::string& s = store.TokenStr(t);
+    if (!s.empty())
+      leaves.push_back(s);
   }
   if (leaves.empty()) {
     uint32_t cp = store.CpOfId(id);
@@ -293,38 +287,33 @@ std::vector<std::string> AtomicDecomposition(
 // postings 读取 / 求交
 // ---------------------------------------------------------------------------
 
-std::vector<std::string> KeysForTerm(IdsStore& store,
-                                     const std::string& term,
-                                     int count) {
-  std::vector<std::string> keys;
-  std::string suffix = (count > 1) ? "*" + std::to_string(count) : "";
-  if (store.FindKey(term + suffix)) {
-    keys.push_back(term + suffix);
-    return keys;
-  }
-  auto pit = store.py_map().find(term);
-  if (pit != store.py_map().end()) {
-    for (uint16_t t : pit->second) {
-      const std::string& token = store.TokenStr(t);
-      if (token.empty())
-        continue;
-      std::string k = token + suffix;
-      if (!store.FindKey(k) && count > 1)
-        k = token;
-      if (store.FindKey(k))
-        keys.push_back(k);
-    }
+std::vector<const KeyEntry*> KeysForTerm(IdsStore& store,
+                                         const std::string& term,
+                                         int count) {
+  std::vector<const KeyEntry*> keys;
+  auto add_token = [&](uint16_t t) {
+    const KeyEntry* e = store.FindKeyByToken(t, count);
+    if (!e && count > 1)
+      e = store.FindKeyByToken(t, 1);
+    if (e)
+      keys.push_back(e);
+  };
+  uint16_t t;
+  if (store.FindToken(term, &t)) {
+    add_token(t);
     if (!keys.empty())
       return keys;
   }
-  uint16_t token = store.ResolveTerm(term);
-  if (token != kNoToken) {
-    std::string k = store.TokenStr(token) + suffix;
-    if (!store.FindKey(k) && count > 1)
-      k = store.TokenStr(token);
-    if (store.FindKey(k))
-      keys.push_back(k);
+  auto pit = store.py_map().find(term);
+  if (pit != store.py_map().end()) {
+    for (uint16_t token : pit->second)
+      add_token(token);
+    if (!keys.empty())
+      return keys;
   }
+  uint16_t rt = store.ResolveTerm(term);
+  if (rt != kNoToken)
+    add_token(rt);
   return keys;
 }
 
@@ -348,11 +337,10 @@ std::vector<uint32_t> IntersectPostings(IdsStore& store,
 
   for (size_t i = 0; i < terms.size(); ++i) {
     TermKeys tk;
-    hash_set<std::string> seen_keys;
-    for (const auto& key : KeysForTerm(store, terms[i], counts[i])) {
-      if (!seen_keys.insert(key).second)
+    hash_set<const KeyEntry*> seen_keys;
+    for (const KeyEntry* e : KeysForTerm(store, terms[i], counts[i])) {
+      if (!seen_keys.insert(e).second)
         continue;
-      const KeyEntry* e = store.FindKey(key);
       if (!e || e->full_cnt == 0)
         continue;
       tk.entries.push_back(e);
@@ -369,18 +357,39 @@ std::vector<uint32_t> IntersectPostings(IdsStore& store,
 
   std::vector<uint32_t> result;
   hash_set<uint32_t> seed_seen;
+  bool need_dedup = term_keys[seed_index].entries.size() > 1;
 
-  for (const KeyEntry* e : term_keys[seed_index].entries) {
-    store.ForEachFull(*e, [&](uint32_t id) {
-      if (!seed_seen.insert(id).second)
+  // 非种子 term 的 id 升序游标。种子遍历本身按 id 升序，因此每个条目只需
+  // 单调推进一次，避免对每个候选重复二分。
+  std::vector<std::vector<uint32_t>> cursor(term_keys.size());
+  for (size_t i = 0; i < term_keys.size(); ++i)
+    cursor[i].assign(term_keys[i].entries.size(), 0);
+
+  for (const KeyEntry* se : term_keys[seed_index].entries) {
+    for (size_t i = 0; i < term_keys.size(); ++i)
+      std::fill(cursor[i].begin(), cursor[i].end(), 0);
+
+    store.ForEachFull(*se, [&](uint32_t id) {
+      if (need_dedup && !seed_seen.insert(id).second)
         return true;
 
       for (size_t i = 0; i < term_keys.size(); ++i) {
         if (i == seed_index)
           continue;
         bool matched = false;
-        for (const KeyEntry* other : term_keys[i].entries) {
-          if (store.FullContains(*other, id)) {
+        const auto& entries = term_keys[i].entries;
+        for (size_t j = 0; j < entries.size(); ++j) {
+          const KeyEntry* other = entries[j];
+          if (other->kind == 0) {
+            const uint32_t* a = store.FullIds(*other);
+            uint32_t& p = cursor[i][j];
+            while (p < other->full_cnt && a[p] < id)
+              ++p;
+            if (p < other->full_cnt && a[p] == id) {
+              matched = true;
+              break;
+            }
+          } else if (store.FullContains(*other, id)) {
             matched = true;
             break;
           }
@@ -405,12 +414,171 @@ void AddCount(std::map<std::string, int>* counts, const std::string& k) {
   (*counts)[k] += 1;
 }
 
-int64_t ScoreHybrid(IdsStore& store,
-                    uint32_t id,
-                    const std::vector<std::string>& normalized,
-                    const std::map<std::string, int>& user_atomics,
-                    const std::vector<std::string>& user_atomic_seq,
-                    hash_map<std::string, std::vector<std::string>>* cache) {
+struct TokenCount {
+  uint16_t token;
+  int count;
+};
+
+void AddTokenCount(std::vector<TokenCount>* counts, uint16_t token) {
+  for (auto& c : *counts) {
+    if (c.token == token) {
+      ++c.count;
+      return;
+    }
+  }
+  counts->push_back({token, 1});
+}
+
+int TokenCountOf(const std::vector<TokenCount>& counts, uint16_t token) {
+  for (const auto& c : counts) {
+    if (c.token == token)
+      return c.count;
+  }
+  return 0;
+}
+
+struct QueryAtoms {
+  std::vector<uint16_t> norm;      // 已 Canon 的输入 token
+  std::vector<TokenCount> counts;  // 输入原子部件计数
+  std::vector<uint16_t> seq;       // 输入原子部件顺序
+};
+
+bool BuildQueryAtoms(IdsStore& store,
+                     const std::vector<std::string>& normalized,
+                     QueryAtoms* q) {
+  for (const auto& raw : normalized) {
+    std::string c = Canon(raw);
+    uint16_t t = store.ResolveTerm(c);
+    if (t == kNoToken)
+      return false;
+    uint32_t cp = store.TokenCp(t);
+    uint32_t id = cp ? store.IdOfCp(cp) : kInvalidId;
+    if (id == kInvalidId)
+      return false;
+    q->norm.push_back(store.CanonToken(t));
+    const uint16_t* atoms = nullptr;
+    uint16_t n = 0;
+    store.Atomics(id, &atoms, &n);
+    if (n == 0)
+      return false;
+    for (uint16_t i = 0; i < n; ++i) {
+      AddTokenCount(&q->counts, atoms[i]);
+      q->seq.push_back(atoms[i]);
+    }
+  }
+  return !q->seq.empty();
+}
+
+int64_t ScoreHybridTokens(IdsStore& store,
+                          uint32_t id,
+                          const QueryAtoms& q) {
+  const uint16_t* leaves = nullptr;
+  uint16_t leaf_n = 0;
+  store.Leaves(id, &leaves, &leaf_n);
+  const uint16_t* atoms = nullptr;
+  uint16_t atom_n = 0;
+  store.Atomics(id, &atoms, &atom_n);
+
+  bool satisfied = true;
+  int missing_count = 0;
+  for (const auto& c : q.counts) {
+    int avail = 0;
+    for (uint16_t i = 0; i < atom_n; ++i) {
+      if (atoms[i] == c.token) {
+        ++avail;
+      }
+    }
+    if (avail < c.count) {
+      satisfied = false;
+      missing_count += c.count - avail;
+    }
+  }
+
+  int extra_count = 0;
+  for (uint16_t i = 0; i < atom_n; ++i) {
+    uint16_t t = atoms[i];
+    // 只在每个 token 第一次出现时统计
+    bool first = true;
+    for (uint16_t j = 0; j < i; ++j) {
+      if (atoms[j] == t) {
+        first = false;
+        break;
+      }
+    }
+    if (!first)
+      continue;
+    int avail = 0;
+    for (uint16_t j = 0; j < atom_n; ++j) {
+      if (atoms[j] == t)
+        ++avail;
+    }
+    int req = TokenCountOf(q.counts, t);
+    if (avail > req)
+      extra_count += avail - req;
+  }
+
+  int64_t ordered_bonus = 0;
+  bool match_macro = (leaf_n == q.norm.size());
+  if (match_macro) {
+    for (size_t i = 0; i < q.norm.size(); ++i) {
+      if (store.CanonToken(leaves[i]) != q.norm[i]) {
+        match_macro = false;
+        break;
+      }
+    }
+  }
+  bool match_macro_rev = false;
+  if (!match_macro && leaf_n == q.norm.size()) {
+    match_macro_rev = true;
+    size_t n = q.norm.size();
+    for (size_t i = 0; i < n; ++i) {
+      if (store.CanonToken(leaves[i]) != q.norm[n - i - 1]) {
+        match_macro_rev = false;
+        break;
+      }
+    }
+  }
+  if (match_macro) {
+    ordered_bonus = 20000000;
+  } else if (match_macro_rev) {
+    ordered_bonus = 10000000;
+  } else if (q.seq.size() == atom_n) {
+    bool seq_match = true;
+    for (size_t i = 0; i < q.seq.size(); ++i) {
+      if (q.seq[i] != atoms[i]) {
+        seq_match = false;
+        break;
+      }
+    }
+    if (seq_match)
+      ordered_bonus = 15000000;
+  }
+
+  int64_t score = 0;
+  if (satisfied) {
+    if (extra_count == 0)
+      score = 50000000 + ordered_bonus;
+    else
+      score = 20000000 - extra_count * 500000 + ordered_bonus / 2;
+  } else {
+    score = -missing_count * 5000000 - extra_count * 500000;
+  }
+
+  int block = store.Hot(id).block;
+  if (block == 0)
+    score += 2000000;
+  else if (block == 1)
+    score += 1000000;
+  return score;
+}
+
+int64_t ScoreHybridStrings(
+    IdsStore& store,
+    uint32_t id,
+    const std::vector<std::string>& normalized,
+    const std::map<std::string, int>& user_atomics,
+    const std::vector<std::string>& user_atomic_seq,
+    hash_map<std::string, std::vector<std::string>>* cache) {
   uint32_t cp = store.CpOfId(id);
   std::string ch = CpToUtf8(cp);
   std::vector<std::string> cand_leaves = TopLeavesById(store, id);
@@ -495,12 +663,10 @@ int64_t ScoreHybrid(IdsStore& store,
   return score;
 }
 
-std::vector<uint32_t> RankHybrid(IdsStore& store,
-                                 std::vector<uint32_t> cands,
-                                 const std::vector<std::string>& normalized) {
-  if (cands.size() <= 1 || normalized.empty())
-    return cands;
-
+std::vector<uint32_t> RankHybridStrings(
+    IdsStore& store,
+    std::vector<uint32_t> cands,
+    const std::vector<std::string>& normalized) {
   std::map<std::string, int> user_atomics;
   std::vector<std::string> user_atomic_seq;
   hash_map<std::string, std::vector<std::string>> cache;
@@ -525,9 +691,46 @@ std::vector<uint32_t> RankHybrid(IdsStore& store,
   scored.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
     scored.push_back({cands[i],
-                      ScoreHybrid(store, cands[i], norm_input, user_atomics,
-                                  user_atomic_seq, &cache),
+                      ScoreHybridStrings(store, cands[i], norm_input,
+                                         user_atomics, user_atomic_seq,
+                                         &cache),
                       i});
+  }
+  std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
+    if (a.score != b.score)
+      return a.score > b.score;
+    return a.index < b.index;
+  });
+  std::vector<uint32_t> out;
+  out.reserve(cands.size());
+  for (const auto& it : scored)
+    out.push_back(it.id);
+  for (size_t i = limit; i < cands.size(); ++i)
+    out.push_back(cands[i]);
+  return out;
+}
+
+std::vector<uint32_t> RankHybrid(IdsStore& store,
+                                 std::vector<uint32_t> cands,
+                                 const std::vector<std::string>& normalized) {
+  if (cands.size() <= 1 || normalized.empty())
+    return cands;
+
+  QueryAtoms q;
+  if (!BuildQueryAtoms(store, normalized, &q))
+    return RankHybridStrings(store, std::move(cands), normalized);
+
+  size_t limit = std::min<size_t>(cands.size(), 500);
+  struct Scored {
+    uint32_t id;
+    int64_t score;
+    size_t index;
+  };
+  std::vector<Scored> scored;
+  scored.reserve(limit);
+  for (size_t i = 0; i < limit; ++i) {
+    scored.push_back(
+        {cands[i], ScoreHybridTokens(store, cands[i], q), i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
     if (a.score != b.score)
@@ -723,7 +926,7 @@ struct ExcludeEntries {
 ExcludeEntries BuildExcludeEntries(IdsStore& store,
                                    const std::vector<std::string>& excludes) {
   ExcludeEntries out;
-  hash_set<std::string> seen_keys;
+  hash_set<const KeyEntry*> seen_keys;
   hash_set<uint32_t> seen_ids;
   auto add_id = [&](uint32_t id) {
     if (id != kInvalidId && seen_ids.insert(id).second)
@@ -739,11 +942,10 @@ ExcludeEntries BuildExcludeEntries(IdsStore& store,
   };
 
   for (const auto& term : excludes) {
-    for (const auto& key : KeysForTerm(store, term, 1)) {
-      if (!seen_keys.insert(key).second)
+    for (const KeyEntry* e : KeysForTerm(store, term, 1)) {
+      if (!seen_keys.insert(e).second)
         continue;
-      if (const KeyEntry* e = store.FindKey(key))
-        out.postings.push_back(e);
+      out.postings.push_back(e);
     }
 
     // 排除项本身也要被排除；倒排只覆盖“包含该部件的字”。
@@ -811,25 +1013,46 @@ std::vector<uint32_t> SearchByLeaves(IdsStore& store,
 
   std::vector<std::string> order;
   std::vector<int> counts;
-  std::map<std::string, int> count_map;
+  order.reserve(normalized.size());
+  counts.reserve(normalized.size());
   for (const auto& n : normalized) {
-    auto it = count_map.find(n);
-    if (it == count_map.end()) {
-      count_map[n] = 1;
+    bool found = false;
+    for (size_t i = 0; i < order.size(); ++i) {
+      if (order[i] == n) {
+        counts[i] += 1;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
       order.push_back(n);
       counts.push_back(1);
-    } else {
-      it->second += 1;
-      for (size_t i = 0; i < order.size(); ++i) {
-        if (order[i] == n) {
-          counts[i] = it->second;
-          break;
-        }
-      }
     }
   }
 
-  std::vector<uint32_t> cands = IntersectPostings(store, order, counts);
+  std::vector<uint32_t> cands;
+  if (order.size() == 1) {
+    // 单 term 只需字频头部；完整倒排可能有十万级 id，且首个 500 候选本应按
+    // 字频选取，直接用 HEAD 既更快也更符合排序目标。
+    std::vector<const KeyEntry*> entries =
+        KeysForTerm(store, order[0], counts[0]);
+    if (entries.size() == 1) {
+      const KeyEntry* e = entries[0];
+      const uint32_t* head = store.HeadIds(*e);
+      cands.assign(head, head + e->head_cnt);
+    } else {
+      hash_set<uint32_t> seen;
+      for (const KeyEntry* e : entries) {
+        const uint32_t* head = store.HeadIds(*e);
+        for (uint32_t i = 0; i < e->head_cnt; ++i) {
+          if (seen.insert(head[i]).second)
+            cands.push_back(head[i]);
+        }
+      }
+    }
+  } else {
+    cands = IntersectPostings(store, order, counts);
+  }
   if (disabled_blocks) {
     cands.erase(std::remove_if(cands.begin(), cands.end(),
                                [&](uint32_t id) {

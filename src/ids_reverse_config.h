@@ -78,7 +78,7 @@ void SaveHybridState(rime::Context* ctx,
                      const std::vector<std::string>& components,
                      const std::vector<std::string>& codes);
 
-// 按统一配置加载 IDS3 数据，并把 custom 文件中的禁用分区合并到配置。
+// 按统一配置加载 IDS4 数据，并把 custom 文件中的禁用分区合并到配置。
 bool EnsureIdsStoreLoaded(const ReverseConfig& config);
 void MergeCustomDisabledBlocks(rime::hash_set<int>* disabled, bool* enabled);
 

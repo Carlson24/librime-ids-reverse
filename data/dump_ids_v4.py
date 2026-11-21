@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dump_ids3.py — IDS3 二进制数据表 (ids_data.bin) 反解与文本导出工具
+dump_ids4.py — IDS4 二进制数据表 (ids_data.bin) 反解与文本导出工具
 """
 
 import sys
@@ -13,7 +13,15 @@ BLOCK_NAMES = [
     "兼容", "兼容补充", "部首补充", "康熙部首", "笔画", "未知"
 ]
 
-def dump_ids3(bin_path, output_path=None, sample_count=None):
+SECTION_NAMES = {
+    1: "CP2ID", 2: "ID2CP", 3: "CHAR", 4: "COLD_IDX", 5: "ALTS",
+    6: "LEAVES", 7: "ATOMS", 8: "COMPSET", 9: "COLD", 10: "TOKENS",
+    11: "PY", 12: "KEY_LOOKUP", 13: "KEY_REC", 14: "POST",
+    15: "VAR_OFF", 16: "VAR", 17: "TOK_CANON", 18: "ATOMIC_SET",
+}
+
+
+def dump_ids4(bin_path, output_path=None, sample_count=None):
     if not os.path.exists(bin_path):
         print(f"Error: {bin_path} does not exist.")
         return
@@ -22,52 +30,61 @@ def dump_ids3(bin_path, output_path=None, sample_count=None):
         blob = f.read()
 
     header = blob[:32]
-    magic, ver, flags, max_cp, num_chars, num_keys, num_sec = struct.unpack('<4sHHIIII', header[:24])
-    if magic != b'IDS3':
-        print(f"Error: Invalid magic {magic}, expected IDS3")
+    magic, ver, flags, max_cp, num_chars, num_keys, num_sec = struct.unpack(
+        '<4sHHIIII', header[:24])
+    if magic != b'IDS4':
+        print(f"Error: Invalid magic {magic}, expected IDS4")
         return
 
-    print(f"=== IDS3 Binary Data Overview ===")
+    print("=== IDS4 Binary Data Overview ===")
     print(f"File Size: {len(blob) / 1024 / 1024:.2f} MB")
     print(f"Magic: {magic.decode('ascii')} (Version {ver})")
     print(f"Total Characters: {num_chars}")
     print(f"Max Codepoint: 0x{max_cp:X}")
-    print(f"Index Keys: {num_keys}")
+    print(f"Key Records: {num_keys}")
     print(f"Sections: {num_sec}")
 
-    # 读取 15 个节区目录
     sections = {}
     st = 32
     for i in range(num_sec):
-        sec_type, pad, off, length = struct.unpack('<IIQQ', blob[st + i * 24: st + (i + 1) * 24])
+        sec_type, pad, off, length = struct.unpack(
+            '<IIQQ', blob[st + i * 24: st + (i + 1) * 24])
         sections[sec_type] = (off, length)
+        name = SECTION_NAMES.get(sec_type, str(sec_type))
+        print(f"  [{name:12s}] off={off:>9} len={length:>10}")
 
-    # 1: CP2ID, 2: ID2CP, 3: HOT, 8: COLD_OFF, 9: COLD
-    id2cp_off, id2cp_len = sections[2]
-    hot_off, hot_len = sections[3]
-    cold_off_off, cold_off_len = sections[8]
+    id2cp_off, _ = sections[2]
+    char_off, _ = sections[3]
+    cold_idx_off, _ = sections[4]
     cold_off, cold_len = sections[9]
 
-    id2cp = struct.unpack(f'<{num_chars}I', blob[id2cp_off: id2cp_off + num_chars * 4])
-    cold_offsets = struct.unpack(f'<{num_chars}I', blob[cold_off_off: cold_off_off + num_chars * 4])
+    id2cp = struct.unpack(
+        f'<{num_chars}I', blob[id2cp_off: id2cp_off + num_chars * 4])
 
     count_to_export = min(num_chars, sample_count) if sample_count else num_chars
 
     lines = []
-    header_line = "# 汉字\tUnicode\t读音\tIDS结构\t分区\t拆分深度\t字频权重"
-    lines.append(header_line)
+    lines.append("# 汉字\tUnicode\t读音\tIDS结构\t分区\t拆分深度\t字频权重")
 
-    for id in range(count_to_export):
-        cp = id2cp[id]
+    for cid in range(count_to_export):
+        cp = id2cp[cid]
         char_str = chr(cp)
 
-        # HOT 记录: freq u32, depth u8, block u8, char_token u16, flags u32 (12字节)
-        h_pos = hot_off + id * 12
-        freq, depth, block_id, char_token, flags = struct.unpack('<IBBH I', blob[h_pos: h_pos + 12])
+        # CHAR: freq u32, flags u32, char_token u16, depth u8, block u8,
+        #       alts_off u32, leaf_off u32, atom_off u32 (24 字节)
+        h_pos = char_off + cid * 24
+        freq, flags, char_token, depth, block_id, alts_off, leaf_off, atom_off = \
+            struct.unpack('<IIHBBIII', blob[h_pos: h_pos + 24])
         block_name = BLOCK_NAMES[block_id] if block_id < len(BLOCK_NAMES) else "未知"
 
-        # COLD 记录: py_len u16, py bytes, ids_len u16, ids bytes
-        c_pos = cold_off + cold_offsets[id]
+        # COLD_IDX: cs_off u32, cold_off u32
+        ci_pos = cold_idx_off + cid * 8
+        cs_off, c_off = struct.unpack('<II', blob[ci_pos: ci_pos + 8])
+
+        # COLD: py_len u16, py bytes, ids_len u16, ids bytes
+        c_pos = cold_off + c_off
+        if c_pos + 2 > cold_off + cold_len:
+            continue
         py_len = struct.unpack('<H', blob[c_pos: c_pos + 2])[0]
         py_str = blob[c_pos + 2: c_pos + 2 + py_len].decode('utf-8', errors='replace')
         p_ids = c_pos + 2 + py_len
@@ -77,11 +94,12 @@ def dump_ids3(bin_path, output_path=None, sample_count=None):
         line = f"{char_str}\tU+{cp:04X}\t{py_str}\t{ids_str}\t{block_name}\t{depth}\t{freq}"
         lines.append(line)
 
-    # 异体字 section (16: VAR_OFF, 17: VAR)，存在则反解导出
-    if 16 in sections and 17 in sections:
-        var_off_off, _ = sections[16]
-        var_off, var_len = sections[17]
-        var_offsets = struct.unpack(f'<{num_chars}I', blob[var_off_off: var_off_off + num_chars * 4])
+    # 异体字 section (15: VAR_OFF, 16: VAR)，存在则反解导出
+    if 15 in sections and 16 in sections:
+        var_off_off, _ = sections[15]
+        var_off, var_len = sections[16]
+        var_offsets = struct.unpack(
+            f'<{num_chars}I', blob[var_off_off: var_off_off + num_chars * 4])
         var_lines = []
         for vid in range(num_chars):
             p = var_off + var_offsets[vid]
@@ -108,7 +126,8 @@ def dump_ids3(bin_path, output_path=None, sample_count=None):
         for l in lines[:16]:
             print(l)
 
+
 if __name__ == '__main__':
     bin_file = sys.argv[1] if len(sys.argv) > 1 else 'ids_data.bin'
     out_file = sys.argv[2] if len(sys.argv) > 2 else 'ids_data_dumped.txt'
-    dump_ids3(bin_file, out_file)
+    dump_ids4(bin_file, out_file)

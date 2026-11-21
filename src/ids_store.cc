@@ -1,5 +1,5 @@
 //
-// ids_store.cc — IDS3 单文件数据加载与寻址（mmap 惰性映射）。
+// ids_store.cc — IDS4 单文件数据加载与寻址（mmap 惰性映射）。
 //
 #include "ids_store.h"
 
@@ -144,7 +144,7 @@ IdsStore& IdsStore::Instance() {
 IdsStore::~IdsStore() = default;
 
 bool IdsStore::Parse() {
-  if (size_ < 32 || std::memcmp(base_, "IDS3", 4) != 0)
+  if (size_ < 32 || std::memcmp(base_, "IDS4", 4) != 0)
     return false;
   max_cp_ = Rd32(base_ + 8);
   num_chars_ = Rd32(base_ + 12);
@@ -154,12 +154,21 @@ bool IdsStore::Parse() {
   if (size_ < 32 + static_cast<size_t>(nsec) * 24)
     return false;
 
+  const uint8_t* tokens_sec = nullptr;
+  uint64_t tokens_len = 0;
+  const uint8_t* py_sec = nullptr;
+  uint64_t py_len = 0;
+  const uint8_t* keyrec_sec = nullptr;
+  uint64_t keyrec_len = 0;
+  const uint8_t* atomset_sec = nullptr;
+  uint64_t atomset_len = 0;
+
   for (uint32_t i = 0; i < nsec; ++i) {
     const uint8_t* e = st + static_cast<size_t>(i) * 24;
     uint32_t type = Rd32(e);
     uint64_t off = Rd64(e + 8);
     uint64_t len = Rd64(e + 16);
-    if (off + len > size_)
+    if (off + len > size_ || off > size_)
       return false;
     const uint8_t* p = base_ + off;
     switch (type) {
@@ -172,32 +181,41 @@ bool IdsStore::Parse() {
       case kSecHot:
         hot_ = reinterpret_cast<const HotRec*>(p);
         break;
-      case kSecAltsOff:
-        alts_off_ = reinterpret_cast<const uint32_t*>(p);
+      case kSecColdIdx:
+        cold_idx_ = reinterpret_cast<const ColdIdxRec*>(p);
         break;
       case kSecAlts:
         alts_ = p;
         break;
-      case kSecCompSetOff:
-        compset_off_ = reinterpret_cast<const uint32_t*>(p);
+      case kSecLeaves:
+        leaves_ = p;
+        break;
+      case kSecAtoms:
+        atoms_ = p;
         break;
       case kSecCompSet:
         compset_ = p;
         break;
-      case kSecColdOff:
-        cold_off_ = reinterpret_cast<const uint32_t*>(p);
-        break;
       case kSecCold:
         cold_ = p;
         break;
-      case kSecPostHead:
-        post_head_ = reinterpret_cast<const uint32_t*>(p);
+      case kSecTokens:
+        tokens_sec = p;
+        tokens_len = len;
         break;
-      case kSecPostSmall:
-        post_small_ = reinterpret_cast<const uint32_t*>(p);
+      case kSecPy:
+        py_sec = p;
+        py_len = len;
         break;
-      case kSecPostBitset:
-        post_bitset_ = reinterpret_cast<const uint64_t*>(p);
+      case kSecKeyLookup:
+        key_lookup_ = reinterpret_cast<const uint32_t*>(p);
+        break;
+      case kSecKeyRec:
+        keyrec_sec = p;
+        keyrec_len = len;
+        break;
+      case kSecPost:
+        post_ = p;
         break;
       case kSecVarOff:
         var_off_ = reinterpret_cast<const uint32_t*>(p);
@@ -205,22 +223,26 @@ bool IdsStore::Parse() {
       case kSecVar:
         var_ = p;
         break;
+      case kSecTokCanon:
+        tok_canon_ = reinterpret_cast<const uint16_t*>(p);
+        break;
+      case kSecAtomicSet:
+        atomset_sec = p;
+        atomset_len = len;
+        break;
       default:
         break;
     }
   }
-  if (!cp2id_ || !id2cp_ || !hot_ || !alts_off_ || !alts_ || !compset_off_ ||
-      !compset_ || !cold_off_ || !cold_ || !post_head_ || !post_small_ ||
-      !post_bitset_)
+  if (!cp2id_ || !id2cp_ || !hot_ || !cold_idx_ || !alts_ || !leaves_ ||
+      !atoms_ || !compset_ || !cold_ || !post_ || !key_lookup_ ||
+      !tokens_sec || !py_sec || !keyrec_sec)
     return false;
 
   // TOKENS
-  for (uint32_t i = 0; i < nsec; ++i) {
-    const uint8_t* e = st + static_cast<size_t>(i) * 24;
-    if (Rd32(e) != kSecTokens)
-      continue;
-    const uint8_t* p = base_ + Rd64(e + 8);
-    const uint8_t* end = p + Rd64(e + 16);
+  {
+    const uint8_t* p = tokens_sec;
+    const uint8_t* end = tokens_sec + tokens_len;
     if (p + 2 > end)
       return false;
     num_tokens_ = Rd16(p);
@@ -242,16 +264,12 @@ bool IdsStore::Parse() {
       token_str_.push_back(std::move(s));
       token_cp_.push_back(cp);
     }
-    break;
   }
 
   // PY
-  for (uint32_t i = 0; i < nsec; ++i) {
-    const uint8_t* e = st + static_cast<size_t>(i) * 24;
-    if (Rd32(e) != kSecPy)
-      continue;
-    const uint8_t* p = base_ + Rd64(e + 8);
-    const uint8_t* end = p + Rd64(e + 16);
+  {
+    const uint8_t* p = py_sec;
+    const uint8_t* end = py_sec + py_len;
     if (p + 2 > end)
       return false;
     uint16_t np = Rd16(p);
@@ -278,47 +296,50 @@ bool IdsStore::Parse() {
       valid_pinyins_.insert(py);
       py_map_[py] = std::move(ids);
     }
-    break;
   }
 
-  // KEYS
-  for (uint32_t i = 0; i < nsec; ++i) {
-    const uint8_t* e = st + static_cast<size_t>(i) * 24;
-    if (Rd32(e) != kSecKeys)
-      continue;
-    const uint8_t* p = base_ + Rd64(e + 8);
-    const uint8_t* end = p + Rd64(e + 16);
-    if (p + 4 > end)
-      return false;
-    uint32_t n = Rd32(p);
-    p += 4;
-    keys_.reserve(n);
-    for (uint32_t k = 0; k < n; ++k) {
-      if (p + 2 > end)
-        return false;
-      uint16_t klen = Rd16(p);
-      p += 2;
-      if (p + klen + 17 > end)
-        return false;
-      std::string key(reinterpret_cast<const char*>(p), klen);
-      p += klen;
-      KeyEntry ke;
-      ke.head_off = Rd32(p);
-      ke.head_cnt = Rd32(p + 4);
-      ke.full_off = Rd32(p + 8);
-      ke.full_cnt = Rd32(p + 12);
-      ke.kind = p[16];
-      p += 17;
-      keys_[std::move(key)] = ke;
+  // KEY_REC
+  key_entries_.reserve(nkeys);
+  {
+    const uint8_t* p = keyrec_sec;
+    const uint8_t* end = keyrec_sec + keyrec_len;
+    while (p + 20 <= end) {
+      KeyRec rec;
+      rec.mult = p[0];
+      rec.entry.kind = p[1];
+      rec.entry.head_off = Rd32(p + 4);
+      rec.entry.head_cnt = Rd32(p + 8);
+      rec.entry.full_off = Rd32(p + 12);
+      rec.entry.full_cnt = Rd32(p + 16);
+      key_entries_.push_back(rec);
+      p += 20;
     }
-    break;
+    if (static_cast<uint32_t>(key_entries_.size()) != nkeys)
+      return false;
   }
-  (void)nkeys;
+
+  // ATOMIC_SET
+  if (atomset_sec) {
+    const uint8_t* p = atomset_sec;
+    const uint8_t* end = atomset_sec + atomset_len;
+    if (p + 2 <= end) {
+      uint16_t n = Rd16(p);
+      p += 2;
+      if (p + static_cast<size_t>(n) * 2 <= end) {
+        for (uint16_t i = 0; i < n; ++i) {
+          atomic_tokens_.insert(Rd16(p));
+          p += 2;
+        }
+      }
+    }
+  }
+
   return true;
 }
 
 bool IdsStore::SmallContains(const KeyEntry& e, uint32_t id) const {
-  const uint32_t* a = post_small_ + e.full_off;
+  const uint32_t* a =
+      reinterpret_cast<const uint32_t*>(post_ + e.full_off);
   return std::binary_search(a, a + e.full_cnt, id);
 }
 
