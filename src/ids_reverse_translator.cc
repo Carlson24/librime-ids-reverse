@@ -695,6 +695,87 @@ std::vector<std::string> SegmentAlphaString(IdsStore& store,
   return items;
 }
 
+// O 模式当前 pending 段的多部件解析结果。
+// tokens 为拼音/双拼音节或单个汉字；开头的 - / + 会被跳过。
+struct PendingComponents {
+  bool valid = false;
+  std::vector<std::string> tokens;
+};
+
+bool IsPendingSeparator(unsigned char c) {
+  return c == '\'' || c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+         c == '.' || c == '_';
+}
+
+// 与 ids_text.cc 的 IsComponentChar 保持一致；此处避免包含 ids_text.h
+// 造成与匿名命名空间内同名帮助函数的歧义。
+bool IsComponentCodePoint(uint32_t cp) {
+  if (cp >= 0x2FF0 && cp <= 0x2FFB)
+    return false;
+  return (cp >= 0x2E80 && cp <= 0x2FDF) || (cp >= 0x31C0 && cp <= 0x31EF) ||
+         cp == 0x3007 || (cp >= 0x3400 && cp <= 0x4DBF) ||
+         (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+         (cp >= 0x20000 && cp <= 0x2FA1F) || (cp >= 0x30000 && cp <= 0x323AF);
+}
+
+PendingComponents ParsePendingComponents(IdsStore& store,
+                                         const std::string& pending,
+                                         const std::string& mode) {
+  PendingComponents out;
+  if (pending.empty())
+    return out;
+
+  size_t i = 0;
+  if (pending[0] == '-' || pending[0] == '+')
+    i = 1;
+
+  std::string ascii;
+  auto flush_ascii = [&]() -> bool {
+    if (ascii.empty())
+      return true;
+    std::vector<std::string> segs = SegmentAlphaString(store, ascii, mode);
+    ascii.clear();
+    for (const auto& seg : segs) {
+      if (!seg.empty())
+        out.tokens.push_back(seg);
+    }
+    return !segs.empty();
+  };
+
+  while (i < pending.size()) {
+    unsigned char c = static_cast<unsigned char>(pending[i]);
+    if (c == '-' || c == '+')
+      return out;  // 一次连写内部的运算符暂不支持
+    if (IsPendingSeparator(c)) {
+      if (!flush_ascii())
+        return out;
+      ++i;
+      continue;
+    }
+    if (c < 0x80) {
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+        return out;
+      ascii.push_back(static_cast<char>(c));
+      ++i;
+      continue;
+    }
+    if (!flush_ascii())
+      return out;
+    size_t start = i;
+    uint32_t cp = DecodeNext(pending, &i);
+    if (i == start || cp == 0 || !IsComponentCodePoint(cp))
+      return out;
+    out.tokens.push_back(pending.substr(start, i - start));
+  }
+  if (!flush_ascii())
+    return out;
+  // 与过滤器 IsComponentText 的长度上限保持一致。
+  if (out.tokens.size() > 8)
+    return out;
+  out.valid = !out.tokens.empty();
+  return out;
+}
+
 const std::vector<uint16_t>* GetCompsByPrefix(IdsStore& store,
                                               const std::string& pref) {
   if (pref.empty())
@@ -1763,6 +1844,105 @@ void IdsReverseTranslator::BuildComponentCandidates(
   }
 }
 
+void IdsReverseTranslator::BuildMultiComponentCandidates(
+    IdsStore& store,
+    const std::vector<std::string>& tokens,
+    const rime::Segment& segment,
+    rime::FifoTranslation* translation) {
+  constexpr size_t kPerTokenLimit = 4;
+  constexpr size_t kMaxCandidates = 40;
+  const hash_set<int>* disabled =
+      config_.disabled_blocks_enabled ? &config_.disabled_blocks : nullptr;
+
+  struct Option {
+    std::string text;
+    int rank = 0;
+    uint32_t freq = 0;
+  };
+
+  std::vector<std::vector<Option>> options;
+  options.reserve(tokens.size());
+  for (const auto& token : tokens) {
+    std::vector<Option> opts;
+    if (!IsAsciiAlphaOnly(token) && Utf8Chars(token).size() == 1) {
+      // 输入串里直接给出的汉字部件。
+      uint32_t cp = CpOf(token);
+      uint32_t id = cp ? store.IdOfCp(cp) : kInvalidId;
+      if (id == kInvalidId)
+        return;
+      if (disabled && disabled->count(static_cast<int>(store.Hot(id).block)))
+        return;
+      opts.push_back({token, 0, store.Hot(id).freq});
+    } else {
+      // 拼音/双拼音节，复用自带部件候选（已按字频排序）。
+      std::vector<uint32_t> ids =
+          GetComponentCandidates(store, token, PinyinMode(), 80);
+      for (uint32_t id : ids) {
+        if (disabled && disabled->count(static_cast<int>(store.Hot(id).block)))
+          continue;
+        uint32_t cp = store.CpOfId(id);
+        if (!cp)
+          continue;
+        opts.push_back(
+            {CpToUtf8(cp), static_cast<int>(opts.size()), store.Hot(id).freq});
+        if (opts.size() >= kPerTokenLimit)
+          break;
+      }
+    }
+    if (opts.empty())
+      return;
+    options.push_back(std::move(opts));
+  }
+
+  struct Combo {
+    std::string text;
+    int rank_sum = 0;
+    uint64_t freq_sum = 0;
+  };
+  auto better = [](const Combo& a, const Combo& b) {
+    if (a.rank_sum != b.rank_sum)
+      return a.rank_sum < b.rank_sum;
+    if (a.freq_sum != b.freq_sum)
+      return a.freq_sum > b.freq_sum;
+    return a.text < b.text;
+  };
+
+  std::vector<Combo> combos(1);
+  for (const auto& opts : options) {
+    std::vector<Combo> next;
+    next.reserve(combos.size() * opts.size());
+    for (const auto& base : combos) {
+      for (const auto& opt : opts) {
+        next.push_back({base.text + opt.text, base.rank_sum + opt.rank,
+                        base.freq_sum + opt.freq});
+      }
+    }
+    std::sort(next.begin(), next.end(), better);
+    if (next.size() > kMaxCandidates * 4)
+      next.resize(kMaxCandidates * 4);
+    combos.swap(next);
+  }
+  std::sort(combos.begin(), combos.end(), better);
+
+  size_t limit = kMaxCandidates;
+  if (config_.max_results > 0)
+    limit = std::min(limit, static_cast<size_t>(config_.max_results));
+
+  hash_set<std::string> seen;
+  size_t emitted = 0;
+  for (const auto& combo : combos) {
+    if (emitted >= limit)
+      break;
+    if (combo.text.empty() || !seen.insert(combo.text).second)
+      continue;
+    auto cand = rime::New<rime::SimpleCandidate>(
+        "hanzi_component", segment.start, segment.end, combo.text, "多部件");
+    cand->set_quality(100.0);
+    translation->Append(cand);
+    ++emitted;
+  }
+}
+
 void IdsReverseTranslator::BuildVariantCandidates(
     IdsStore& store,
     uint32_t base_id,
@@ -1847,9 +2027,24 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
     BuildResultCandidates(store, results, segment, pending, translation.get());
   } else if (!pending.empty() && pending != "-" && pending != "+" &&
              has_component) {
-    std::vector<uint32_t> results =
-        GetComponentCandidates(store, pending, PinyinMode(), 80);
-    BuildComponentCandidates(store, results, segment, translation.get());
+    PendingComponents parsed =
+        ParsePendingComponents(store, pending, PinyinMode());
+    if (parsed.valid && parsed.tokens.size() >= 2) {
+      // 多音节/多汉字连写：一次给出可加入多个部件的组合候选。
+      BuildMultiComponentCandidates(store, parsed.tokens, segment,
+                                    translation.get());
+    } else if (parsed.valid && parsed.tokens.size() == 1 &&
+               !IsAsciiAlphaOnly(parsed.tokens[0])) {
+      // 直接输入单个汉字时，不依赖 echo_translator。
+      auto cand = rime::New<rime::SimpleCandidate>(
+          "hanzi_component", segment.start, segment.end, parsed.tokens[0], "");
+      cand->set_quality(100.0);
+      translation->Append(cand);
+    } else {
+      std::vector<uint32_t> results =
+          GetComponentCandidates(store, pending, PinyinMode(), 80);
+      BuildComponentCandidates(store, results, segment, translation.get());
+    }
   }
 
   if (translation->size() == 0)

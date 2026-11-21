@@ -33,10 +33,6 @@ using rime::New;
 using rime::Segment;
 using rime::Segmentation;
 
-bool IsSingleChar(const std::string& text) {
-  return Utf8Length(text) == 1 && !HasWhitespace(text);
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -235,6 +231,15 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     return rime::kNoop;
   }
 
+  // 兼容前端把汉字以 X11 Unicode keysym 直接送入 O 模式的情况。
+  if (!ctrl && !alt && code >= 0x01000100 && code <= 0x0110FFFF) {
+    uint32_t cp = static_cast<uint32_t>(code - 0x01000000);
+    if (IsComponentChar(cp)) {
+      ctx->PushInput(CpToUtf8(cp));
+      return rime::kAccepted;
+    }
+  }
+
   if (code == XK_Escape || repr == "Escape") {
     ctx->set_property(kVariantsProperty, "");
     ctx->Clear();
@@ -247,6 +252,26 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
       engine_->CommitText(config_.hybrid.prefix);
       ctx->Clear();
       return rime::kAccepted;
+    }
+    // 多字部件候选或结果候选：回车直接确认当前候选。
+    // 单字部件仍保留“把编码作为一个部件”的旧行为。
+    if (ctx->HasMenu()) {
+      an<Candidate> cand = ctx->GetSelectedCandidate();
+      if (cand) {
+        an<Candidate> genuine = Candidate::GetGenuineCandidate(cand);
+        const std::string& type = cand->type();
+        const std::string& genuine_type = genuine ? genuine->type() : type;
+        bool is_result = type == "ids_reverse" || type == "hanzi_result" ||
+                         genuine_type == "ids_reverse" ||
+                         genuine_type == "hanzi_result";
+        bool is_multi_component =
+            (type == "hanzi_component" || genuine_type == "hanzi_component") &&
+            Utf8Length(cand->text()) > 1;
+        if (is_result || is_multi_component) {
+          ctx->ConfirmCurrentSelection();
+          return rime::kAccepted;
+        }
+      }
     }
     if (!st.pending.empty() && st.pending != "-" && st.pending != "+") {
       if (!ctx->composition().empty())
@@ -267,7 +292,11 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   if (code == XK_BackSpace || repr == "BackSpace") {
     HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
     if (!st.pending.empty()) {
-      if (st.pending.size() == 1 && !st.components.empty()) {
+      const size_t pending_chars = Utf8Length(st.pending);
+      size_t pending_bytes = LastUtf8CharBytes(st.pending);
+      if (pending_bytes == 0)
+        pending_bytes = 1;
+      if (pending_chars == 1 && !st.components.empty()) {
         if (!ctx->composition().empty())
           ctx->composition().pop_back();
         if (!ctx->composition().empty()) {
@@ -277,7 +306,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
           sep.status = Segment::kVoid;
         }
       }
-      ctx->PopInput(1);
+      ctx->PopInput(pending_bytes);
     } else if (!st.components.empty()) {
       st.components.pop_back();
       st.codes.pop_back();
@@ -509,7 +538,7 @@ class HybridFilterTranslation : public rime::PrefetchTranslation {
       const bool component_stage = seg.HasTag("hanzi_component");
       if (!component_stage)
         continue;
-      if (next->end() == seg.end && IsSingleChar(next->text()) &&
+      if (next->end() == seg.end && IsComponentText(next->text()) &&
           seen_.insert(next->text()).second) {
         cache_.push_back(New<rime::ShadowCandidate>(next, "hanzi_component"));
       }

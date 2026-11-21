@@ -103,6 +103,49 @@ bool HasWhitespace(const std::string& s) {
   return false;
 }
 
+bool IsComponentChar(uint32_t cp) {
+  // 排除 IDS 结构符。
+  if (cp >= 0x2FF0 && cp <= 0x2FFB)
+    return false;
+  return (cp >= 0x2E80 && cp <= 0x2FDF) ||    // 部首补充、康熙部首
+         (cp >= 0x31C0 && cp <= 0x31EF) ||    // 笔画
+         cp == 0x3007 ||                      // 〇
+         (cp >= 0x3400 && cp <= 0x4DBF) ||    // 扩展 A
+         (cp >= 0x4E00 && cp <= 0x9FFF) ||    // 基本区
+         (cp >= 0xF900 && cp <= 0xFAFF) ||    // 兼容汉字
+         (cp >= 0x20000 && cp <= 0x2FA1F) ||  // 扩展 B~F
+         (cp >= 0x30000 && cp <= 0x323AF);    // 扩展 G~H
+}
+
+bool IsComponentText(const std::string& text, size_t max_chars) {
+  if (text.empty() || max_chars == 0 || HasWhitespace(text))
+    return false;
+  size_t count = 0;
+  size_t i = 0;
+  while (i < text.size()) {
+    size_t old = i;
+    uint32_t cp = DecodeNext(text, &i);
+    if (i == old || cp == 0 || !IsComponentChar(cp))
+      return false;
+    if (++count > max_chars)
+      return false;
+  }
+  return count > 0;
+}
+
+size_t LastUtf8CharBytes(const std::string& s) {
+  if (s.empty())
+    return 0;
+  size_t start = s.size() - 1;
+  size_t steps = 0;
+  while (start > 0 && steps < 4 &&
+         (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) {
+    --start;
+    ++steps;
+  }
+  return s.size() - start;
+}
+
 std::string Join(const std::vector<std::string>& parts,
                  const std::string& sep) {
   std::string r;

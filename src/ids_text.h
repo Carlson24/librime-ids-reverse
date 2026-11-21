@@ -19,6 +19,13 @@ size_t Utf8Length(const std::string& s);
 bool IsIdc(uint32_t cp);
 bool HasWhitespace(const std::string& s);
 
+// 是否为可用作 IDS 部件的汉字/部首/笔画字符。
+bool IsComponentChar(uint32_t cp);
+// 是否为 1~max_chars 个部件字符组成的文本（不允许空白、ASCII、标点）。
+bool IsComponentText(const std::string& text, size_t max_chars = 8);
+// 返回字符串末尾一个 UTF-8 字符占用的字节数。
+size_t LastUtf8CharBytes(const std::string& s);
+
 std::string Join(const std::vector<std::string>& parts, const std::string& sep);
 
 // 将 IDS 结构符转换为指定展示格式。
