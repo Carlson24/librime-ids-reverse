@@ -51,6 +51,8 @@ struct ReverseConfig {
 constexpr char kHybridStateProperty[] = "ids_reverse_components";
 // 异体字查询的基准字（/ 触发时由 processor 写入，translator 读取）。
 constexpr char kVariantsProperty[] = "ids_reverse_variants";
+// 结果替换后的异体字（Shift+V 替换结果时写入，作为当前结果候选）。
+constexpr char kVariantsResultProperty[] = "ids_reverse_variants_result";
 // 混合检字结果段使用的内部标签（与可配置 tag 区分）。
 constexpr char kResultSegmentTag[] = "ids_reverse_result";
 

@@ -33,6 +33,24 @@ using rime::New;
 using rime::Segment;
 using rime::Segmentation;
 
+// 判断单字是否有异体字；数据尚未加载时保持原有行为。
+bool HasVariants(const std::string& text) {
+  IdsStore& store = IdsStore::Instance();
+  if (!store.loaded())
+    return true;
+  size_t pos = 0;
+  uint32_t cp = DecodeNext(text, &pos);
+  if (!cp || pos != text.size())
+    return false;
+  uint32_t id = store.IdOfCp(cp);
+  if (id == kInvalidId)
+    return false;
+  const uint32_t* variants = nullptr;
+  uint16_t n = 0;
+  store.Variants(id, &variants, &n);
+  return n > 0;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -98,6 +116,7 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
   if (selected_is_result_) {
     engine_->CommitText(selected_text_);
     ctx->set_property(kVariantsProperty, "");
+    ctx->set_property(kVariantsResultProperty, "");
     ctx->Clear();
   } else {
     HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
@@ -113,6 +132,7 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
       text = "!" + text;
     }
     ctx->set_property(kVariantsProperty, "");
+    ctx->set_property(kVariantsResultProperty, "");
     st.components.push_back(text);
     st.codes.push_back(st.pending);
     SaveHybridState(ctx, st.components, st.codes);
@@ -260,6 +280,7 @@ bool IdsReverseProcessor::TryReplaceVariant(Context* ctx) {
 
   std::string pending_query =
       st.pending.substr(0, st.pending.size() - trigger.size());
+  const bool result_replacement = pending_query.empty();
   std::string component = variant;
   if (!pending_query.empty() &&
       (pending_query[0] == '-' || pending_query[0] == '+' ||
@@ -267,18 +288,34 @@ bool IdsReverseProcessor::TryReplaceVariant(Context* ctx) {
     component = pending_query.substr(0, 1) + variant;
   }
 
-  // 将已有部件文本和异体字重新拼成原始表达式，例如：
-  // O葵/ -> O𦷡；O艹癸葵/ -> O艹癸𦷡。
-  // 这样 preedit 不依赖结果菜单，也不会残留引号尾段。
-  std::string expression;
-  for (const auto& existing : st.components)
-    expression += existing;
-  expression += component;
-
   ctx->set_property(kVariantsProperty, "");
-  SaveHybridState(ctx, {}, {});
-  ctx->Clear();
-  ctx->set_input(config_.hybrid.prefix + expression);
+  ctx->set_property(kVariantsResultProperty, variant);
+
+  if (result_replacement) {
+    // 替换的是结果候选（O艹癸 → 葵 → /）：保留前置部件文本用于显示，
+    // 异体字由 translator 作为当前结果候选输出。
+    std::string expression;
+    for (const auto& existing : st.components)
+      expression += existing;
+    expression += component;
+    SaveHybridState(ctx, {}, {});
+    ctx->Clear();
+    ctx->set_input(config_.hybrid.prefix + expression);
+  } else {
+    // 替换的是待输入原字（O葵/）：把异体字直接作为已加入的部件，
+    // 这样后续输入 - / + / ! 时能正常作用于它。
+    std::vector<std::string> components = st.components;
+    components.push_back(component);
+    std::vector<std::string> codes = components;
+    std::string input = config_.hybrid.prefix;
+    for (const auto& code : codes) {
+      input += code;
+      input += "'";
+    }
+    SaveHybridState(ctx, components, codes);
+    ctx->Clear();
+    ctx->set_input(input);
+  }
   return true;
 }
 
@@ -325,6 +362,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
 
   if (code == XK_Escape || repr == "Escape") {
     ctx->set_property(kVariantsProperty, "");
+    ctx->set_property(kVariantsResultProperty, "");
     ctx->Clear();
     return rime::kAccepted;
   }
@@ -374,6 +412,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   }
 
   if (code == XK_BackSpace || repr == "BackSpace") {
+    ctx->set_property(kVariantsResultProperty, "");
     HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
     if (!st.pending.empty()) {
       const size_t pending_chars = Utf8Length(st.pending);
@@ -450,6 +489,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
                      (code == XK_1 && shift));
 
   if (is_variant) {
+    ctx->set_property(kVariantsResultProperty, "");
     // 异体字触发：以菜单当前选中候选为基准，写入 property
     // 后推入触发符驱动重译。
     if (!ctx->HasMenu() || ctx->composition().empty())
@@ -476,8 +516,28 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
       ctx->set_property(kVariantsProperty, "");
       return rime::kNoop;
     }
-    ctx->set_property(kVariantsProperty,
-                      is_result && genuine ? genuine->text() : cand->text());
+    const std::string base =
+        is_result && genuine ? genuine->text() : cand->text();
+
+    // 单字部件加入状态后，结果菜单显示的是“包含该部件的字”。
+    // 若高亮结果没有异体字，则回退为查询该部件本身：
+    // O葵 → 空格 → / 应显示 葵 的异体字，而不是当前结果。
+    if (is_result) {
+      HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+      if (st.pending.empty() && st.components.size() == 1 &&
+          Utf8Length(st.components[0]) == 1 && st.components[0] != base &&
+          !HasVariants(base)) {
+        const std::string component = st.components[0];
+        ctx->set_property(kVariantsProperty, component);
+        SaveHybridState(ctx, {}, {});
+        ctx->Clear();
+        ctx->set_input(config_.hybrid.prefix + component +
+                       config_.variant_trigger);
+        return rime::kAccepted;
+      }
+    }
+
+    ctx->set_property(kVariantsProperty, base);
     ctx->PushInput(config_.variant_trigger);
     return rime::kAccepted;
   }
@@ -486,6 +546,35 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     return rime::kAccepted;
 
   if (is_letter || is_minus || is_plus || is_exclude) {
+    // 异体字替换后继续输入：确保异体字已作为独立部件存在，
+    // 让后续运算作用于它，而不是把它留作 pending 原始输入。
+    const std::string variant_result =
+        ctx->get_property(kVariantsResultProperty);
+    if (!variant_result.empty()) {
+      HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+      bool already_component = false;
+      if (!st.components.empty()) {
+        const std::string& last = st.components.back();
+        const std::string base =
+            (!last.empty() &&
+             (last[0] == '-' || last[0] == '+' || last[0] == '!'))
+                ? last.substr(1)
+                : last;
+        already_component = (base == variant_result);
+      }
+      ctx->set_property(kVariantsResultProperty, "");
+      ctx->set_property(kVariantsProperty, "");
+      if (!already_component) {
+        // 结果替换：保留原始表达式作为显示用 code，让 preedit 维持
+        // O艹癸𦮙；实际参与检字运算的部件是异体字本身。
+        std::string display = st.pending;
+        if (display.empty())
+          display = variant_result;
+        SaveHybridState(ctx, {variant_result}, {display});
+        ctx->Clear();
+        ctx->set_input(config_.hybrid.prefix + display + "'");
+      }
+    }
     char ch = is_minus ? '-' : (is_plus ? '+' : (is_exclude ? '!' : repr[0]));
     if (ch >= 'A' && ch <= 'Z')
       ch = static_cast<char>(ch - 'A' + 'a');

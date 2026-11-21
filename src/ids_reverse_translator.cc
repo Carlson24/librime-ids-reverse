@@ -1977,6 +1977,7 @@ void IdsReverseTranslator::BuildVariantCandidates(
     IdsStore& store,
     uint32_t base_id,
     const std::string& base,
+    const std::string& preedit,
     const rime::Segment& segment,
     rime::FifoTranslation* translation) {
   bool show_pinyin = config_.show_pinyin;
@@ -2002,8 +2003,9 @@ void IdsReverseTranslator::BuildVariantCandidates(
 
   if (n == 0) {
     // 无异体字：提示候选，text 为基准字，选中即上屏。
-    auto cand = rime::New<rime::SimpleCandidate>(
-        "ids_reverse", segment.start, segment.end, base, "〔无异体字〕", "/\t");
+    auto cand = rime::New<rime::SimpleCandidate>("ids_reverse", segment.start,
+                                                 segment.end, base,
+                                                 "〔无异体字〕", preedit);
     cand->set_quality(100.0);
     translation->Append(cand);
     return;
@@ -2018,7 +2020,7 @@ void IdsReverseTranslator::BuildVariantCandidates(
         BuildComment(store, vid, show_pinyin, show_ids, show_unicode,
                      show_block, config_.ids_format);
     auto cand = rime::New<rime::SimpleCandidate>(
-        "ids_reverse", segment.start, segment.end, text, comment, "/\t");
+        "ids_reverse", segment.start, segment.end, text, comment, preedit);
     cand->set_quality(100.0);
     translation->Append(cand);
   }
@@ -2042,6 +2044,56 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
   const std::string& pending = st.pending;
   bool variant_pending = EndsWith(pending, config_.variant_trigger);
 
+  const std::string variant_result = ctx->get_property(kVariantsResultProperty);
+  bool variant_result_stage = false;
+  if (!variant_pending && !variant_result.empty()) {
+    if (EndsWith(pending, variant_result)) {
+      // 结果替换：raw 表达式以异体字结尾。
+      variant_result_stage = true;
+    } else if (pending.empty() && !st.components.empty()) {
+      // 待输入原字替换：异体字已作为最后一个部件加入状态。
+      const std::string& last = st.components.back();
+      const std::string base =
+          (!last.empty() &&
+           (last[0] == '-' || last[0] == '+' || last[0] == '!'))
+              ? last.substr(1)
+              : last;
+      variant_result_stage = (base == variant_result);
+    }
+  }
+  if (variant_result_stage) {
+    // 结果替换后的异体字作为当前结果候选，而不是把
+    // “前置部件 + 异体字”重新解析成多部件查询。
+    uint32_t cp = CpOf(variant_result);
+    uint32_t id = cp ? store.IdOfCp(cp) : kInvalidId;
+    std::string comment;
+    if (id != kInvalidId) {
+      bool show_pinyin = config_.show_pinyin;
+      bool show_ids = config_.show_ids;
+      bool show_unicode = config_.show_unicode;
+      bool show_block = config_.show_block;
+      if (config_.has_sw_pinyin)
+        show_pinyin = ctx->get_option("show_pinyin");
+      if (config_.has_sw_ids)
+        show_ids = ctx->get_option("show_ids");
+      if (config_.has_sw_unicode)
+        show_unicode = ctx->get_option("show_unicode");
+      if (config_.has_sw_block)
+        show_block = ctx->get_option("show_block");
+      comment = BuildComment(store, id, show_pinyin, show_ids, show_unicode,
+                             show_block, config_.ids_format);
+    }
+    // 部件形式的状态末尾带有分隔引号，用空 preedit 隐藏它；
+    // raw 表达式形式则保留原始输入作为 preedit。
+    std::string preedit = pending.empty() ? "\t" : std::string();
+    auto cand = rime::New<rime::SimpleCandidate>("ids_reverse", segment.start,
+                                                 segment.end, variant_result,
+                                                 comment, preedit);
+    cand->set_quality(100.0);
+    translation->Append(cand);
+    return translation;
+  }
+
   if (variant_pending) {
     // 异体字查询：基准字由 processor 写入 property。
     // 允许 O葵/ 这种尚未加入正向部件的单字候选查询。
@@ -2049,7 +2101,15 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
     if (!base.empty()) {
       uint32_t cp = CpOf(base);
       uint32_t base_id = cp ? store.IdOfCp(cp) : kInvalidId;
-      BuildVariantCandidates(store, base_id, base, segment, translation.get());
+      // 触发符前仍有输入时，基准字会被候选 preedit 替换，需要一并显示；
+      // 若基准字已由前一段显示（O艹癸 → /），则只显示触发符。
+      const std::string query =
+          pending.substr(0, pending.size() - config_.variant_trigger.size());
+      std::string preedit = config_.variant_trigger + "\t";
+      if (!query.empty())
+        preedit = base + config_.variant_trigger + "\t";
+      BuildVariantCandidates(store, base_id, base, preedit, segment,
+                             translation.get());
     }
   } else if ((pending.empty() || pending == "-" || pending == "+" ||
               pending == "!") &&

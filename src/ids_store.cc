@@ -235,8 +235,8 @@ bool IdsStore::Parse() {
     }
   }
   if (!cp2id_ || !id2cp_ || !hot_ || !cold_idx_ || !alts_ || !leaves_ ||
-      !atoms_ || !compset_ || !cold_ || !post_ || !key_lookup_ ||
-      !tokens_sec || !py_sec || !keyrec_sec)
+      !atoms_ || !compset_ || !cold_ || !post_ || !key_lookup_ || !tokens_sec ||
+      !py_sec || !keyrec_sec)
     return false;
 
   // TOKENS
@@ -338,8 +338,7 @@ bool IdsStore::Parse() {
 }
 
 bool IdsStore::SmallContains(const KeyEntry& e, uint32_t id) const {
-  const uint32_t* a =
-      reinterpret_cast<const uint32_t*>(post_ + e.full_off);
+  const uint32_t* a = reinterpret_cast<const uint32_t*>(post_ + e.full_off);
   return std::binary_search(a, a + e.full_cnt, id);
 }
 

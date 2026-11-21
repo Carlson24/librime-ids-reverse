@@ -469,9 +469,7 @@ bool BuildQueryAtoms(IdsStore& store,
   return !q->seq.empty();
 }
 
-int64_t ScoreHybridTokens(IdsStore& store,
-                          uint32_t id,
-                          const QueryAtoms& q) {
+int64_t ScoreHybridTokens(IdsStore& store, uint32_t id, const QueryAtoms& q) {
   const uint16_t* leaves = nullptr;
   uint16_t leaf_n = 0;
   store.Leaves(id, &leaves, &leaf_n);
@@ -692,8 +690,7 @@ std::vector<uint32_t> RankHybridStrings(
   for (size_t i = 0; i < limit; ++i) {
     scored.push_back({cands[i],
                       ScoreHybridStrings(store, cands[i], norm_input,
-                                         user_atomics, user_atomic_seq,
-                                         &cache),
+                                         user_atomics, user_atomic_seq, &cache),
                       i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
@@ -729,8 +726,7 @@ std::vector<uint32_t> RankHybrid(IdsStore& store,
   std::vector<Scored> scored;
   scored.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
-    scored.push_back(
-        {cands[i], ScoreHybridTokens(store, cands[i], q), i});
+    scored.push_back({cands[i], ScoreHybridTokens(store, cands[i], q), i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
     if (a.score != b.score)

@@ -338,8 +338,7 @@ class IdsStore {
   template <class F>
   void ForEachFull(const KeyEntry& e, F&& f) const {
     if (e.kind == 0) {
-      const uint32_t* a =
-          reinterpret_cast<const uint32_t*>(post_ + e.full_off);
+      const uint32_t* a = reinterpret_cast<const uint32_t*>(post_ + e.full_off);
       for (uint32_t i = 0; i < e.full_cnt; ++i)
         if (!f(a[i]))
           return;
