@@ -359,8 +359,8 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
 
   bool is_letter = !ctrl && !alt && repr.size() == 1 &&
                    std::isalpha(static_cast<unsigned char>(repr[0]));
-  bool is_variant = !ctrl && !alt &&
-                    (code == XK_slash || repr == "/" || repr == "slash");
+  bool is_variant =
+      !ctrl && !alt && (code == XK_slash || repr == "/" || repr == "slash");
   bool is_minus =
       !ctrl && !alt && (code == XK_minus || repr == "minus" || repr == "-");
   bool is_plus = !ctrl && !alt &&
@@ -371,7 +371,8 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
                      (code == XK_1 && shift));
 
   if (is_variant) {
-    // 异体字触发：以菜单当前选中候选为基准，写入 property 后推入触发符驱动重译。
+    // 异体字触发：以菜单当前选中候选为基准，写入 property
+    // 后推入触发符驱动重译。
     if (!ctx->HasMenu() || ctx->composition().empty())
       return rime::kNoop;
     Segment& seg = ctx->composition().back();

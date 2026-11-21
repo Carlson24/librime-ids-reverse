@@ -230,8 +230,7 @@ std::vector<std::string> TopLeavesOfComponent(IdsStore& store,
   uint32_t id = store.IdOfCp(cp);
   if (id == kInvalidId)
     return {preserve_glyph ? comp : Canon(comp)};
-  std::vector<std::string> leaves =
-      TopLeavesById(store, id, preserve_glyph);
+  std::vector<std::string> leaves = TopLeavesById(store, id, preserve_glyph);
   if (leaves.empty())
     leaves.push_back(preserve_glyph ? comp : Canon(comp));
   return leaves;
@@ -624,8 +623,7 @@ std::optional<std::vector<std::string>> SubtractCharacter(
 
   std::vector<std::string> leaves =
       TopLeavesOfComponent(store, base, /*preserve_glyph=*/true);
-  if (leaves.size() <= 1 && !leaves.empty() &&
-      Canon(leaves[0]) == norm_base)
+  if (leaves.size() <= 1 && !leaves.empty() && Canon(leaves[0]) == norm_base)
     return std::nullopt;
 
   // 1. 直接叶子命中。保留原始字形，但比较使用归一化部件。
