@@ -79,6 +79,7 @@ ids_reverse:
   show_block: true
   ids_format: unicode            # unicode | bracket | plain
   variant_trigger: "/"           # O 模式异体字查询触发符，可自定义
+  variant_replace_key: "Shift+V" # 用选中异体字替换 preedit 原字
   # disabled_blocks: [扩A, 扩展B]
 
   search_prefix: "I"
@@ -142,6 +143,7 @@ ids_reverse:
 - `!` 排除：`O木木!口` 排除包含 `口` 的字，例如结果中不再出现 `啉`。
   `!` 与 `-` / `+` 一样是已选部件之间的运算符：先选 `木木`，输入 `!`，再输入
   `kou` 正常选择 `口`。排除按深层部件判断。
+  排除项本身也会被排除，例如 `O刀口!召` 的结果中不会出现 `召`。
   `!` 一次性生效：排除一个部件后，后续选中的部件自动恢复为正向；继续排除请再次
   输入 `!`。
 - 连续拼音表达式（如 `Omumu!kou`）不支持，行为与 `Omumu-kou` 一致：先选中正向
@@ -154,7 +156,14 @@ ids_reverse:
 - `/`（触发符，可通过 `variant_trigger` 自定义）：**异体字查询**。以菜单当前选中
   候选为基准，从 `ids_variants.txt` 编译进 `ids_data.bin` 的变体表中查询其异体字。
   例如 `O艹亏` 首选 `芌`，按 `/` 显示其异体字 `芋`；`O艹于` 首选 `芋`，按 `/`
-  显示 `芌 芋`。无变体时显示 `〔无异体字〕` 提示候选（选中即上屏基准字）。
+  显示 `芌 芋`。单字部件候选也支持直接查询，例如 `O葵/` 显示 `葵` 的异体字
+  `𦮙 𦷡 𫶙`，不需要先把 `葵` 加入状态。无变体时显示 `〔无异体字〕` 提示候选
+  （选中即上屏基准字）。
+- 异体字替换：在异体字菜单中选中候选后按 `variant_replace_key`（默认 `Shift+V`），
+  会用该异体字替换 preedit 中的原字，而不是直接上屏。例如 `O葵/` 选 `𦷡` 后按
+  `Shift+V`，preedit 变为 `O𦷡`；`O艹癸` 得到 `葵` 后按 `/`，再选 `𦷡` 并替换，
+  preedit 变为 `O艹癸𦷡`。替换后仍是未提交组合，可以按空格把当前文本加入为部件，
+  或继续输入 `-艹` 等运算符。
 - 使用 `hybrid_prefix`、`hybrid_tag`、`hybrid_tips`。
 
 O 模式自带的部件候选来自 `ids_data.bin`，因此即使当前方案没有拼音词典，也可以完成
@@ -185,6 +194,7 @@ patch:
     show_block: true
     ids_format: unicode
     variant_trigger: "/"
+    variant_replace_key: "Shift+V"
     search_prefix: "I"
     search_tag: ids_reverse_search
     search_tips: "〔部件检字〕"
@@ -277,8 +287,12 @@ O 模式：
 - `O森-木+氵-氵` → 多步交替运算
 - `O木木!口` → 结果包含 `木木`，但排除含 `口` 的字（不出现 `啉`）
 - `O木木!木` → 正向结果都含 `木`，排除后为空
+- `O刀口!召` → 结果不出现 `召` 本身，也不出现包含 `召` 的字
 - `O艹亏` → `芌`，按 `/` → 显示异体字 `芋`
 - `O艹于` → `芋`，按 `/` → 显示异体字 `芌 芋`
+- `O葵` → 单字部件候选，直接按 `/` → 显示异体字 `𦮙 𦷡 𫶙`
+- `O葵/` → 选 `𦷡` → `Shift+V` → preedit `O𦷡`
+- `O艹癸` → 选 `艹癸` → 结果 `葵` → `/` → 选 `𦷡` → `Shift+V` → preedit `O艹癸𦷡`
 - `Omu` + 回车 → 以 `mu` 作为部件继续检字
 - `Ctrl+Enter` → 上屏当前候选 IDS
 

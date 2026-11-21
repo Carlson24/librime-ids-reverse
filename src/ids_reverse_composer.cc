@@ -42,6 +42,14 @@ using rime::Segmentation;
 IdsReverseProcessor::IdsReverseProcessor(const rime::Ticket& ticket)
     : Processor(ticket) {
   LoadReverseConfig(ticket, &name_space_, &config_);
+  if (!config_.variant_replace_key.empty()) {
+    has_variant_replace_key_ =
+        variant_replace_key_.Parse(config_.variant_replace_key);
+    if (!has_variant_replace_key_) {
+      LOG(WARNING) << "ids_reverse: invalid variant_replace_key: '"
+                   << config_.variant_replace_key << "'";
+    }
+  }
   Context* ctx = engine_ ? engine_->context() : nullptr;
   if (ctx) {
     select_before_ = ctx->select_notifier().connect(
@@ -104,6 +112,7 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
                text[0] != '!') {
       text = "!" + text;
     }
+    ctx->set_property(kVariantsProperty, "");
     st.components.push_back(text);
     st.codes.push_back(st.pending);
     SaveHybridState(ctx, st.components, st.codes);
@@ -200,6 +209,76 @@ bool IdsReverseProcessor::HandleSelectionKey(int digit, Context* ctx) {
   if (target >= count)
     return true;
   ctx->Select(target);
+  return true;
+}
+
+bool IdsReverseProcessor::MatchesVariantReplaceKey(
+    const rime::KeyEvent& key_event) const {
+  if (!has_variant_replace_key_)
+    return false;
+  const int modifier = key_event.modifier() & ~kLockMask;
+  const int target_modifier = variant_replace_key_.modifier() & ~kLockMask;
+  if (modifier != target_modifier)
+    return false;
+  int keycode = key_event.keycode();
+  int target_keycode = variant_replace_key_.keycode();
+  if (keycode == target_keycode)
+    return true;
+  // 容忍前端以大小写不同的 keysym 报告 Shift+V / Shift+v。
+  auto lower = [](int c) {
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+  };
+  return lower(keycode) == lower(target_keycode);
+}
+
+bool IdsReverseProcessor::TryReplaceVariant(Context* ctx) {
+  if (!ctx || !IsReverseActive(ctx, config_.hybrid.prefix))
+    return false;
+  if (ctx->get_property(kVariantsProperty).empty())
+    return false;
+  if (!ctx->HasMenu() || ctx->composition().empty())
+    return false;
+
+  HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+  const std::string& trigger = config_.variant_trigger;
+  if (!EndsWith(st.pending, trigger))
+    return false;
+
+  Segment& seg = ctx->composition().back();
+  if (!seg.menu)
+    return false;
+  size_t index = seg.selected_index;
+  seg.menu->Prepare(index + 1);
+  an<Candidate> cand = seg.GetCandidateAt(index);
+  if (!cand || cand->text().empty() || cand->type() != "ids_reverse")
+    return false;
+
+  const std::string base = ctx->get_property(kVariantsProperty);
+  const std::string variant = cand->text();
+  if (variant == base)
+    return true;  // 无异体字提示候选：消费按键，不改变状态。
+
+  std::string pending_query =
+      st.pending.substr(0, st.pending.size() - trigger.size());
+  std::string component = variant;
+  if (!pending_query.empty() &&
+      (pending_query[0] == '-' || pending_query[0] == '+' ||
+       pending_query[0] == '!')) {
+    component = pending_query.substr(0, 1) + variant;
+  }
+
+  // 将已有部件文本和异体字重新拼成原始表达式，例如：
+  // O葵/ -> O𦷡；O艹癸葵/ -> O艹癸𦷡。
+  // 这样 preedit 不依赖结果菜单，也不会残留引号尾段。
+  std::string expression;
+  for (const auto& existing : st.components)
+    expression += existing;
+  expression += component;
+
+  ctx->set_property(kVariantsProperty, "");
+  SaveHybridState(ctx, {}, {});
+  ctx->Clear();
+  ctx->set_input(config_.hybrid.prefix + expression);
   return true;
 }
 
@@ -384,14 +463,27 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     if (!cand || cand->text().empty())
       return rime::kNoop;
     an<Candidate> genuine = Candidate::GetGenuineCandidate(cand);
-    const std::string& type = genuine ? genuine->type() : cand->type();
-    if (type != "ids_reverse" && type != "hanzi_result")
+    const std::string& outer_type = cand->type();
+    const std::string& genuine_type = genuine ? genuine->type() : outer_type;
+    bool is_result =
+        outer_type == "ids_reverse" || outer_type == "hanzi_result" ||
+        genuine_type == "ids_reverse" || genuine_type == "hanzi_result";
+    // 单字部件候选也允许直接查异体字，例如 O葵/。
+    bool is_single_component = (outer_type == "hanzi_component" ||
+                                genuine_type == "hanzi_component") &&
+                               Utf8Length(cand->text()) == 1;
+    if (!is_result && !is_single_component) {
+      ctx->set_property(kVariantsProperty, "");
       return rime::kNoop;
+    }
     ctx->set_property(kVariantsProperty,
-                      genuine ? genuine->text() : cand->text());
+                      is_result && genuine ? genuine->text() : cand->text());
     ctx->PushInput(config_.variant_trigger);
     return rime::kAccepted;
   }
+
+  if (MatchesVariantReplaceKey(key_event) && TryReplaceVariant(ctx))
+    return rime::kAccepted;
 
   if (is_letter || is_minus || is_plus || is_exclude) {
     char ch = is_minus ? '-' : (is_plus ? '+' : (is_exclude ? '!' : repr[0]));
@@ -403,6 +495,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
         ctx->composition().back().HasTag(config_.hybrid.tag)) {
       ctx->ClearNonConfirmedComposition();
     }
+    ctx->set_property(kVariantsProperty, "");
     ctx->PushInput(std::string(1, ch));
     return rime::kAccepted;
   }

@@ -28,6 +28,7 @@ patch:
     show_block: true
     ids_format: unicode
     variant_trigger: "/"
+    variant_replace_key: "Shift+V"
 
     search_prefix: "I"
     search_tag: ids_reverse_search

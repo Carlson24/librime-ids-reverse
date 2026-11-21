@@ -2040,9 +2040,11 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
   HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
   auto translation = rime::New<rime::FifoTranslation>();
   const std::string& pending = st.pending;
+  bool variant_pending = EndsWith(pending, config_.variant_trigger);
 
-  if (pending == config_.variant_trigger && !st.components.empty()) {
+  if (variant_pending) {
     // 异体字查询：基准字由 processor 写入 property。
+    // 允许 O葵/ 这种尚未加入正向部件的单字候选查询。
     std::string base = ctx->get_property(kVariantsProperty);
     if (!base.empty()) {
       uint32_t cp = CpOf(base);

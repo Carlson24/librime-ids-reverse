@@ -713,27 +713,67 @@ std::vector<uint32_t> PureSubtractionResults(
   return results;
 }
 
-using ExcludeEntries = std::vector<const KeyEntry*>;
+struct ExcludeEntries {
+  std::vector<const KeyEntry*> postings;  // 部件分解中包含排除项的字
+  std::vector<uint32_t> self_ids;         // 排除项本身对应的字
+
+  bool empty() const { return postings.empty() && self_ids.empty(); }
+};
 
 ExcludeEntries BuildExcludeEntries(IdsStore& store,
                                    const std::vector<std::string>& excludes) {
   ExcludeEntries out;
-  hash_set<std::string> seen;
+  hash_set<std::string> seen_keys;
+  hash_set<uint32_t> seen_ids;
+  auto add_id = [&](uint32_t id) {
+    if (id != kInvalidId && seen_ids.insert(id).second)
+      out.self_ids.push_back(id);
+  };
+  auto add_term_id = [&](const std::string& term) {
+    if (Utf8Chars(term).size() != 1)
+      return;
+    size_t pos = 0;
+    uint32_t cp = DecodeNext(term, &pos);
+    if (cp)
+      add_id(store.IdOfCp(cp));
+  };
+
   for (const auto& term : excludes) {
     for (const auto& key : KeysForTerm(store, term, 1)) {
-      if (!seen.insert(key).second)
+      if (!seen_keys.insert(key).second)
         continue;
       if (const KeyEntry* e = store.FindKey(key))
-        out.push_back(e);
+        out.postings.push_back(e);
+    }
+
+    // 排除项本身也要被排除；倒排只覆盖“包含该部件的字”。
+    add_term_id(term);
+    std::string canon = Canon(term);
+    if (canon != term)
+      add_term_id(canon);
+
+    // 拼音排除时，同时排除该拼音对应部件本身的字。
+    auto pit = store.py_map().find(term);
+    if (pit != store.py_map().end()) {
+      for (uint16_t t : pit->second) {
+        uint32_t cp = store.TokenCp(t);
+        if (cp)
+          add_id(store.IdOfCp(cp));
+      }
     }
   }
+  std::sort(out.self_ids.begin(), out.self_ids.end());
+  out.self_ids.erase(std::unique(out.self_ids.begin(), out.self_ids.end()),
+                     out.self_ids.end());
   return out;
 }
 
 bool ContainsExcluded(IdsStore& store,
                       const ExcludeEntries& entries,
                       uint32_t id) {
-  for (const KeyEntry* e : entries) {
+  if (std::binary_search(entries.self_ids.begin(), entries.self_ids.end(), id))
+    return true;
+  for (const KeyEntry* e : entries.postings) {
     if (store.FullContains(*e, id))
       return true;
   }

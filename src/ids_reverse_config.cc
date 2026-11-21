@@ -78,6 +78,11 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
          s.compare(0, prefix.size(), prefix) == 0;
 }
 
+bool EndsWith(const std::string& s, const std::string& suffix) {
+  return !suffix.empty() && s.size() >= suffix.size() &&
+         s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 std::string DefaultReverseNamespace(const rime::Ticket& ticket) {
   if (ticket.name_space.empty() || ticket.name_space == "processor" ||
       ticket.name_space == "segmentor" || ticket.name_space == "translator" ||
@@ -112,6 +117,7 @@ void LoadReverseConfig(const rime::Ticket& ticket,
   conf->GetString(ns + "/shuangpin_scheme", &config->shuangpin_scheme);
   conf->GetString(ns + "/ids_format", &config->ids_format);
   conf->GetString(ns + "/variant_trigger", &config->variant_trigger);
+  conf->GetString(ns + "/variant_replace_key", &config->variant_replace_key);
   conf->GetInt(ns + "/max_results", &config->max_results);
 
   if (config->search.prefix.empty())
@@ -136,6 +142,8 @@ void LoadReverseConfig(const rime::Ticket& ticket,
     config->data_path = "ids_data.bin";
   if (config->variant_trigger.empty())
     config->variant_trigger = "/";
+  if (config->variant_replace_key.empty())
+    config->variant_replace_key = "Shift+V";
   if (config->shuangpin_scheme != "zrm" &&
       config->shuangpin_scheme != "quanpin")
     config->shuangpin_scheme = "flypy";

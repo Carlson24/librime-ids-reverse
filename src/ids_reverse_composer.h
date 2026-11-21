@@ -9,6 +9,7 @@
 #include <rime/common.h>
 #include <rime/context.h>
 #include <rime/filter.h>
+#include <rime/key_event.h>
 #include <rime/processor.h>
 #include <rime/segmentor.h>
 #include <rime/translation.h>
@@ -31,6 +32,8 @@ class IdsReverseProcessor : public rime::Processor {
   void OnUpdate(rime::Context* ctx);
   bool HandleIdsHotkey(const rime::KeyEvent& key_event, rime::Context* ctx);
   bool HandleSelectionKey(int digit, rime::Context* ctx);
+  bool MatchesVariantReplaceKey(const rime::KeyEvent& key_event) const;
+  bool TryReplaceVariant(rime::Context* ctx);
 
   ReverseConfig config_;
   rime::connection select_before_;
@@ -42,6 +45,8 @@ class IdsReverseProcessor : public rime::Processor {
   std::string selected_text_;
   std::string selected_component_;
   bool saved_auto_commit_ = false;
+  rime::KeyEvent variant_replace_key_;
+  bool has_variant_replace_key_ = false;
 };
 
 // search 模式整段打标签；hybrid 模式动态分段。

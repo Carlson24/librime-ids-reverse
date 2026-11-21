@@ -33,6 +33,7 @@ struct ReverseConfig {
   std::string shuangpin_scheme = "flypy";
   std::string ids_format = "unicode";
   std::string variant_trigger = "/";
+  std::string variant_replace_key = "Shift+V";
   int max_results = 60;
   bool show_pinyin = true;
   bool show_ids = true;
@@ -54,6 +55,7 @@ constexpr char kVariantsProperty[] = "ids_reverse_variants";
 constexpr char kResultSegmentTag[] = "ids_reverse_result";
 
 bool StartsWith(const std::string& s, const std::string& prefix);
+bool EndsWith(const std::string& s, const std::string& suffix);
 
 std::string DefaultReverseNamespace(const rime::Ticket& ticket);
 
