@@ -23,6 +23,8 @@ bool HasWhitespace(const std::string& s);
 bool IsComponentChar(uint32_t cp);
 // 是否为 1~max_chars 个部件字符组成的文本（不允许空白、ASCII、标点）。
 bool IsComponentText(const std::string& text, size_t max_chars = 8);
+// 部件表达式：部件字符，以及 + / - / ! 运算符。
+bool IsComponentExpression(const std::string& text, size_t max_chars = 32);
 // 返回字符串末尾一个 UTF-8 字符占用的字节数。
 size_t LastUtf8CharBytes(const std::string& s);
 

@@ -563,23 +563,29 @@ std::string NormalizeAlgebraItem(IdsStore& store,
   return NormalizeComponent(store, s, mode);
 }
 
-// 流式解析操作符：支持任意次 + / - 交替；汉字串按字符拆分为独立运算项。
+// 流式解析操作符：支持任意次 + / - / ! 交替；汉字串按字符拆分为独立运算项。
+// ! 是一次性排除：处理完一个 ! 项后恢复为正向，避免影响后续新选的部件。
 std::vector<AlgebraStep> ParseAlgebraSteps(
     const std::vector<std::string>& components) {
   std::vector<AlgebraStep> steps;
   char curr_op = '+';
   for (const auto& raw : components) {
     std::string s = StripSpace(raw);
+    // 上一条以 ! 结尾时，新条目默认恢复正向；显式运算符仍可覆盖。
+    if (curr_op == '!' && !s.empty() && s[0] != '+' && s[0] != '-' &&
+        s[0] != '!') {
+      curr_op = '+';
+    }
     size_t i = 0;
     while (i < s.size()) {
       char c = s[i];
-      if (c == '+' || c == '-') {
+      if (c == '+' || c == '-' || c == '!') {
         curr_op = c;
         ++i;
         continue;
       }
       size_t start = i;
-      while (i < s.size() && s[i] != '+' && s[i] != '-')
+      while (i < s.size() && s[i] != '+' && s[i] != '-' && s[i] != '!')
         ++i;
       std::string item = s.substr(start, i - start);
       if (item.empty())
@@ -590,6 +596,8 @@ std::vector<AlgebraStep> ParseAlgebraSteps(
         for (const auto& ch : Utf8Chars(item))
           steps.push_back({curr_op, ch});
       }
+      if (curr_op == '!')
+        curr_op = '+';
     }
   }
   return steps;
@@ -707,14 +715,53 @@ std::vector<uint32_t> PureSubtractionResults(
   return results;
 }
 
+using ExcludeEntries = std::vector<const KeyEntry*>;
+
+ExcludeEntries BuildExcludeEntries(IdsStore& store,
+                                   const std::vector<std::string>& excludes) {
+  ExcludeEntries out;
+  hash_set<std::string> seen;
+  for (const auto& term : excludes) {
+    for (const auto& key : KeysForTerm(store, term, 1)) {
+      if (!seen.insert(key).second)
+        continue;
+      if (const KeyEntry* e = store.FindKey(key))
+        out.push_back(e);
+    }
+  }
+  return out;
+}
+
+bool ContainsExcluded(IdsStore& store,
+                      const ExcludeEntries& entries,
+                      uint32_t id) {
+  for (const KeyEntry* e : entries) {
+    if (store.FullContains(*e, id))
+      return true;
+  }
+  return false;
+}
+
+void RemoveExcluded(IdsStore& store,
+                    const ExcludeEntries& entries,
+                    std::vector<uint32_t>* ids) {
+  if (!ids || entries.empty())
+    return;
+  ids->erase(std::remove_if(ids->begin(), ids->end(),
+                            [&](uint32_t id) {
+                              return ContainsExcluded(store, entries, id);
+                            }),
+             ids->end());
+}
+
 // 按部件叶子列表检索“包含这些部件”的字。
 // 普通多项检索与纯减法后的扩展检索共用，保证两者排序/过滤一致。
-std::vector<uint32_t> SearchByLeaves(
-    IdsStore& store,
-    const std::vector<std::string>& leaves,
-    const std::string& mode,
-    size_t max_results,
-    const rime::hash_set<int>* disabled_blocks) {
+std::vector<uint32_t> SearchByLeaves(IdsStore& store,
+                                     const std::vector<std::string>& leaves,
+                                     const std::string& mode,
+                                     size_t max_results,
+                                     const rime::hash_set<int>* disabled_blocks,
+                                     const ExcludeEntries& exclude_entries) {
   std::vector<std::string> normalized;
   for (const auto& raw : leaves) {
     std::string n = NormalizeComponent(store, raw, mode);
@@ -753,6 +800,7 @@ std::vector<uint32_t> SearchByLeaves(
                                }),
                 cands.end());
   }
+  RemoveExcluded(store, exclude_entries, &cands);
   cands = RankHybrid(store, std::move(cands), normalized);
   if (cands.size() > max_results)
     cands.resize(max_results);
@@ -771,6 +819,7 @@ std::vector<uint32_t> SearchHybrid(IdsStore& store,
 
   std::vector<AlgebraStep> steps = ParseAlgebraSteps(components);
   std::vector<std::string> current;
+  std::vector<std::string> excludes;
   bool pure_sub = true;
   bool has_sub = false;
 
@@ -782,18 +831,23 @@ std::vector<uint32_t> SearchHybrid(IdsStore& store,
       if (!current.empty() && has_sub)
         pure_sub = false;
       current.push_back(item);
+    } else if (step.op == '!') {
+      excludes.push_back(item);
     } else {
       has_sub = true;
       current = ApplySingleSubtraction(store, current, item);
     }
   }
 
+  ExcludeEntries exclude_entries = BuildExcludeEntries(store, excludes);
+
   // 纯减法：先给出剩余部件本身，再同步检索包含这些部件的字。
   // 例如 O达-大：首选 辶，随后列出 边/达/近/连/道 等。
   if (pure_sub && has_sub && !current.empty()) {
     std::vector<uint32_t> results = PureSubtractionResults(store, current);
-    std::vector<uint32_t> expanded =
-        SearchByLeaves(store, current, mode, max_results, disabled_blocks);
+    RemoveExcluded(store, exclude_entries, &results);
+    std::vector<uint32_t> expanded = SearchByLeaves(
+        store, current, mode, max_results, disabled_blocks, exclude_entries);
 
     hash_set<uint32_t> seen;
     seen.reserve(results.size() + expanded.size());
@@ -817,7 +871,8 @@ std::vector<uint32_t> SearchHybrid(IdsStore& store,
   if (current.empty())
     return {};
 
-  return SearchByLeaves(store, current, mode, max_results, disabled_blocks);
+  return SearchByLeaves(store, current, mode, max_results, disabled_blocks,
+                        exclude_entries);
 }
 
 std::vector<uint32_t> GetComponentCandidates(IdsStore& store,
@@ -825,7 +880,8 @@ std::vector<uint32_t> GetComponentCandidates(IdsStore& store,
                                              const std::string& mode,
                                              size_t limit) {
   std::string code = StripSpace(raw_code);
-  while (!code.empty() && (code.front() == '-' || code.front() == '+'))
+  while (!code.empty() &&
+         (code.front() == '-' || code.front() == '+' || code.front() == '!'))
     code.erase(code.begin());
   if (code.empty())
     return {};

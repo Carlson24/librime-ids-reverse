@@ -133,6 +133,31 @@ bool IsComponentText(const std::string& text, size_t max_chars) {
   return count > 0;
 }
 
+bool IsComponentExpression(const std::string& text, size_t max_chars) {
+  if (text.empty() || max_chars == 0 || HasWhitespace(text))
+    return false;
+  size_t count = 0;
+  bool has_component = false;
+  size_t i = 0;
+  while (i < text.size()) {
+    size_t old = i;
+    uint32_t cp = DecodeNext(text, &i);
+    if (i == old || cp == 0)
+      return false;
+    if (cp == '+' || cp == '-' || cp == '!') {
+      if (++count > max_chars)
+        return false;
+      continue;
+    }
+    if (!IsComponentChar(cp))
+      return false;
+    has_component = true;
+    if (++count > max_chars)
+      return false;
+  }
+  return has_component;
+}
+
 size_t LastUtf8CharBytes(const std::string& s) {
   if (s.empty())
     return 0;

@@ -100,6 +100,9 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
     } else if (!text.empty() && !st.pending.empty() && st.pending[0] == '+' &&
                text[0] != '+') {
       text = "+" + text;
+    } else if (!text.empty() && !st.pending.empty() && st.pending[0] == '!' &&
+               text[0] != '!') {
+      text = "!" + text;
     }
     st.components.push_back(text);
     st.codes.push_back(st.pending);
@@ -215,6 +218,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   const int code = key_event.keycode();
   const bool ctrl = key_event.ctrl();
   const bool alt = key_event.alt();
+  const bool shift = key_event.shift();
 
   if (!IsReverseActive(ctx, config_.hybrid.prefix)) {
     if (!ctx->get_option("ascii_mode") && !ctrl && !alt &&
@@ -273,7 +277,8 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
         }
       }
     }
-    if (!st.pending.empty() && st.pending != "-" && st.pending != "+") {
+    if (!st.pending.empty() && st.pending != "-" && st.pending != "+" &&
+        st.pending != "!") {
       if (!ctx->composition().empty())
         ctx->composition().pop_back();
       st.components.push_back(st.pending);
@@ -297,14 +302,21 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
       if (pending_bytes == 0)
         pending_bytes = 1;
       if (pending_chars == 1 && !st.components.empty()) {
-        if (!ctx->composition().empty())
+        ctx->PopInput(pending_bytes);
+        while (!ctx->composition().empty() &&
+               ctx->composition().back().start ==
+                   ctx->composition().back().end) {
           ctx->composition().pop_back();
+        }
         if (!ctx->composition().empty()) {
           Segment& sep = ctx->composition().back();
           sep.tags.clear();
           sep.tags.insert(config_.hybrid.tag);
+          sep.tags.insert(kResultSegmentTag);
           sep.status = Segment::kVoid;
         }
+        ctx->set_input(ctx->input());
+        return rime::kAccepted;
       }
       ctx->PopInput(pending_bytes);
     } else if (!st.components.empty()) {
@@ -322,7 +334,8 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     return rime::kAccepted;
   }
 
-  if (!ctrl && !alt && code >= XK_1 && code <= XK_6) {
+  if (!ctrl && !alt && code >= XK_1 && code <= XK_6 &&
+      !(shift && code == XK_1)) {
     if (ctx->HasMenu()) {
       HandleSelectionKey(code - XK_0, ctx);
       return rime::kAccepted;
@@ -353,6 +366,9 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   bool is_plus = !ctrl && !alt &&
                  (code == XK_plus || code == XK_equal || repr == "plus" ||
                   repr == "equal" || repr == "+" || repr == "=");
+  bool is_exclude = !ctrl && !alt &&
+                    (code == XK_exclam || repr == "!" || repr == "exclam" ||
+                     (code == XK_1 && shift));
 
   if (is_variant) {
     // 异体字触发：以菜单当前选中候选为基准，写入 property 后推入触发符驱动重译。
@@ -376,8 +392,8 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     return rime::kAccepted;
   }
 
-  if (is_letter || is_minus || is_plus) {
-    char ch = is_minus ? '-' : (is_plus ? '+' : repr[0]);
+  if (is_letter || is_minus || is_plus || is_exclude) {
+    char ch = is_minus ? '-' : (is_plus ? '+' : (is_exclude ? '!' : repr[0]));
     if (ch >= 'A' && ch <= 'Z')
       ch = static_cast<char>(ch - 'A' + 'a');
     if (ctx->caret_pos() != ctx->input().size())
@@ -451,7 +467,7 @@ bool IdsReverseSegmentor::Proceed(Segmentation* segmentation) {
   } else {
     size_t next_quote = input.find('\'', start + 1);
     char first_char = (start < input.size()) ? input[start] : '\0';
-    if (first_char == '-' || first_char == '+') {
+    if (first_char == '-' || first_char == '+' || first_char == '!') {
       bool has_code_after =
           (start + 1 < input.size()) &&
           (next_quote == std::string::npos || next_quote > start + 1);
@@ -538,7 +554,7 @@ class HybridFilterTranslation : public rime::PrefetchTranslation {
       const bool component_stage = seg.HasTag("hanzi_component");
       if (!component_stage)
         continue;
-      if (next->end() == seg.end && IsComponentText(next->text()) &&
+      if (next->end() == seg.end && IsComponentExpression(next->text()) &&
           seen_.insert(next->text()).second) {
         cache_.push_back(New<rime::ShadowCandidate>(next, "hanzi_component"));
       }

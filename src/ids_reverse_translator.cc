@@ -718,6 +718,34 @@ bool IsComponentCodePoint(uint32_t cp) {
          (cp >= 0x20000 && cp <= 0x2FA1F) || (cp >= 0x30000 && cp <= 0x323AF);
 }
 
+// 完整汉字表达式，例如 木木!口 / 森-木；不接受 ASCII 拼音。
+bool IsComponentExpression(const std::string& text) {
+  if (text.empty())
+    return false;
+  size_t count = 0;
+  bool has_component = false;
+  size_t i = 0;
+  while (i < text.size()) {
+    unsigned char c = static_cast<unsigned char>(text[i]);
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+      return false;
+    if (c == '+' || c == '-' || c == '!') {
+      ++i;
+      ++count;
+      continue;
+    }
+    if (c < 0x80)
+      return false;
+    size_t start = i;
+    uint32_t cp = DecodeNext(text, &i);
+    if (i == start || cp == 0 || !IsComponentCodePoint(cp))
+      return false;
+    has_component = true;
+    ++count;
+  }
+  return has_component && count <= 32;
+}
+
 PendingComponents ParsePendingComponents(IdsStore& store,
                                          const std::string& pending,
                                          const std::string& mode) {
@@ -726,7 +754,7 @@ PendingComponents ParsePendingComponents(IdsStore& store,
     return out;
 
   size_t i = 0;
-  if (pending[0] == '-' || pending[0] == '+')
+  if (pending[0] == '-' || pending[0] == '+' || pending[0] == '!')
     i = 1;
 
   std::string ascii;
@@ -769,7 +797,7 @@ PendingComponents ParsePendingComponents(IdsStore& store,
   }
   if (!flush_ascii())
     return out;
-  // 与过滤器 IsComponentText 的长度上限保持一致。
+  // 限制一次多部件输入的长度，避免组合候选爆炸。
   if (out.tokens.size() > 8)
     return out;
   out.valid = !out.tokens.empty();
@@ -1811,6 +1839,8 @@ void IdsReverseTranslator::BuildResultCandidates(
     preedit = "-\t";
   else if (pending == "+")
     preedit = "+\t";
+  else if (pending == "!")
+    preedit = "!\t";
 
   for (uint32_t id : results) {
     uint32_t cp = store.CpOfId(id);
@@ -2019,25 +2049,39 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
       uint32_t base_id = cp ? store.IdOfCp(cp) : kInvalidId;
       BuildVariantCandidates(store, base_id, base, segment, translation.get());
     }
-  } else if ((pending.empty() || pending == "-" || pending == "+") &&
+  } else if ((pending.empty() || pending == "-" || pending == "+" ||
+              pending == "!") &&
              !st.components.empty()) {
     std::vector<uint32_t> results = SearchHybrid(
         store, st.components, PinyinMode(), config_.max_results,
         config_.disabled_blocks_enabled ? &config_.disabled_blocks : nullptr);
     BuildResultCandidates(store, results, segment, pending, translation.get());
   } else if (!pending.empty() && pending != "-" && pending != "+" &&
-             has_component) {
+             pending != "!" && has_component) {
     PendingComponents parsed =
         ParsePendingComponents(store, pending, PinyinMode());
     if (parsed.valid && parsed.tokens.size() >= 2) {
       // 多音节/多汉字连写：一次给出可加入多个部件的组合候选。
       BuildMultiComponentCandidates(store, parsed.tokens, segment,
                                     translation.get());
-    } else if (parsed.valid && parsed.tokens.size() == 1 &&
-               !IsAsciiAlphaOnly(parsed.tokens[0])) {
-      // 直接输入单个汉字时，不依赖 echo_translator。
+    } else if (parsed.valid && parsed.tokens.size() == 1) {
+      if (!IsAsciiAlphaOnly(parsed.tokens[0])) {
+        // 直接输入单个汉字时，不依赖 echo_translator。
+        auto cand =
+            rime::New<rime::SimpleCandidate>("hanzi_component", segment.start,
+                                             segment.end, parsed.tokens[0], "");
+        cand->set_quality(100.0);
+        translation->Append(cand);
+      } else {
+        // ! / - / + 后的拼音仍走正常部件选字流程。
+        std::vector<uint32_t> results =
+            GetComponentCandidates(store, parsed.tokens[0], PinyinMode(), 80);
+        BuildComponentCandidates(store, results, segment, translation.get());
+      }
+    } else if (IsComponentExpression(pending)) {
+      // 原始汉字表达式：一次加入整个表达式，例如 木木!口。
       auto cand = rime::New<rime::SimpleCandidate>(
-          "hanzi_component", segment.start, segment.end, parsed.tokens[0], "");
+          "hanzi_component", segment.start, segment.end, pending, "部件表达式");
       cand->set_quality(100.0);
       translation->Append(cand);
     } else {
