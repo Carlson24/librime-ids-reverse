@@ -2,12 +2,16 @@
 
 librime 插件：**部件检字（IDS 模糊搜字）翻译器**，C++ 原生实现。
 
+另提供一份单文件 **Lua 5.5** 实现 `ids_reverse.lua`，功能与 C++ 版对等，
+直接复用同一份 `ids_data.bin` 和 `ids_reverse` 配置。两者二选一挂载。
+
 包含两套模式：
 
 - **I 模式**：`I` + 部件/拼音，例如 `I木口`、`Ikouhao`，由原生 processor/segmentor 触发。
 - **O 模式**：`O` + 汉字、全拼、双拼混合检字，支持 `-` 减法、`+` 加法、回车字母直出、IDS 结构上屏。
 
-O 模式为**插件自包含实现**，不需要 Lua，也不依赖任何外部输入法方案。
+C++ 版 O 模式为**插件自包含实现**，不需要 Lua，也不依赖任何外部输入法方案；
+Lua 5.5 版见下文「Lua 5.5 版本」。
 
 ---
 
@@ -52,6 +56,122 @@ COLD → VAR → ID2CP`。
 
 两种模式共用同一个配置命名空间 `ids_reverse`。共享项放在顶层，
 只有 `tag`、`prefix`、`tips` 用 `search_` / `hybrid_` 前缀区分。
+
+---
+
+## Lua 5.5 版本
+
+单文件实现位于插件根目录：
+
+```text
+plugins/ids-reverse/ids_reverse.lua
+```
+
+### 依赖
+
+- `librime` 需要启用 `librime-lua` 插件（Lua 5.5 运行时）。
+- 不需要编译 `librime-ids-reverse.so`。
+- 继续使用现有的 `ids_data.bin`，无需生成新数据。
+
+### 部署
+
+Rime 的 Lua `require` 只搜索用户数据目录或共享数据目录下的 `lua/`。
+源码虽然放在插件根目录，运行时仍需复制到：
+
+```text
+<用户数据目录>/lua/ids_reverse.lua
+```
+
+或：
+
+```text
+<共享数据目录>/lua/ids_reverse.lua
+```
+
+CMake 安装规则会把该文件放到共享数据目录的 `lua/` 下。
+
+### 组件引用
+
+单文件返回 `processor` / `segmentor` / `translator` / `filter` 四个子表：
+
+```yaml
+engine:
+  processors:
+    - lua_processor@*ids_reverse*processor@ids_reverse
+    - ascii_composer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+
+  segmentors:
+    - lua_segmentor@*ids_reverse*segmentor@ids_reverse
+    - abc_segmentor
+    - fallback_segmentor
+
+  translators:
+    - echo_translator
+    - lua_translator@*ids_reverse*translator@ids_reverse
+
+  filters:
+    - lua_filter@*ids_reverse*filter@ids_reverse
+    - uniquifier
+```
+
+`@ids_reverse` 用于让组件读取现有的 `ids_reverse` 配置节点。配置项与 C++ 版完全一致。
+
+参考：
+
+- `examples/ids_reverse.lua.schema.yaml`
+- `examples/attach.lua.patch.yaml`
+
+### 与 C++ 版的差异
+
+- Lua 版会在首次检字时把约 30MB 的 `ids_data.bin` 读入内存；C++ 版使用
+  `mmap` 惰性映射。桌面端正常使用无影响。
+- Lua 的 `select_notifier` 没有 `at_front`，因此 O 模式会临时关闭
+  `_auto_commit`，由 Lua 组件自己处理结果上屏和部件状态。
+- 两个版本共用 `ids_reverse` 配置与 property 名称，但不要同时挂载两套组件。
+
+### 测试
+
+```sh
+lua5.5 plugins/ids-reverse/tests/test_ids_reverse.lua
+```
+
+测试会覆盖数据加载、全拼/双拼、I 模式、O 模式加减排除、异体字和多部件组合。
+如果 `ids_data.bin` 不在默认位置，可作为参数传入：
+
+```sh
+lua5.5 plugins/ids-reverse/tests/test_ids_reverse.lua path/to/ids_data.bin
+```
+
+延迟基准：
+
+```sh
+lua5.5 plugins/ids-reverse/tests/bench_ids_reverse.lua
+```
+
+参考数据（Lua 5.5.1，桌面开发机）：
+
+| 场景 | 冷查询 | 缓存命中 |
+|---|---:|---:|
+| I 单字 `木` | ~0.4–0.8 ms | ~0.001 ms |
+| I 双部件 `木口` | ~10–17 ms | ~0.001 ms |
+| I 拼音 `kouhao` | ~0.7–1.2 ms | ~0.001 ms |
+| O 单部件 `木木` | ~1.4–2.7 ms | ~0.001 ms |
+| O 双部件 `木口` | ~9–10 ms | ~0.001 ms |
+| O 减法 `森-木` | ~1.4–2.6 ms | ~0.001 ms |
+| O 排除 `木木!口` | ~1.7–3.1 ms | ~0.001 ms |
+| 部件候选 `mu` | ~0.03–0.06 ms | ~0.03–0.06 ms |
+
+首次加载数据约 25–45 ms。I 模式双部件交叉检索是当前最慢的冷查询路径。
+
+同机 C++ 版冷查询大致为：I 双部件约 1 ms、O 单部件约 0.02 ms。Lua 版
+冷查询约为 C++ 的 10–50 倍，但 O 模式通常在 3 ms 内，结果缓存命中后低于
+0.001 ms；I 模式双部件首次查询约 10–17 ms。
 
 ---
 

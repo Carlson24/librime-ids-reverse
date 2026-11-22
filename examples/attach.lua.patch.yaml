@@ -1,0 +1,38 @@
+# 把 Lua 5.5 版挂接到现有 Rime 方案的参考 patch
+#
+# 用法：
+#   1. 把 ids_reverse.lua 放到 <用户数据目录>/lua/ids_reverse.lua；
+#   2. 把本文件内容合并到 <方案名>.custom.yaml 的 patch: 节点下；
+#   3. 把 ids_data.bin 放到用户数据目录的 build/ 下；
+#   4. 重新部署。
+#
+# Lua 版与 C++ 原生版二选一挂载，不要同时加入四个 ids_reverse 组件。
+
+patch:
+  engine/processors/@before 0: lua_processor@*ids_reverse*processor@ids_reverse
+  engine/segmentors/@before 0: lua_segmentor@*ids_reverse*segmentor@ids_reverse
+  engine/filters/@before 0: lua_filter@*ids_reverse*filter@ids_reverse
+
+  engine/translators/+:
+    - lua_translator@*ids_reverse*translator@ids_reverse
+
+  ids_reverse:
+    data_file: build/ids_data.bin
+    custom_file: ids_custom.txt
+    max_results: 60
+    shuangpin_scheme: flypy
+    show_pinyin: true
+    show_ids: true
+    show_unicode: true
+    show_block: true
+    ids_format: unicode
+    variant_trigger: "/"
+    variant_replace_key: "Shift+V"
+
+    search_prefix: "I"
+    search_tag: ids_reverse_search
+    search_tips: "〔部件检字〕"
+
+    hybrid_prefix: "O"
+    hybrid_tag: ids_reverse_hybrid
+    hybrid_tips: "〔汉字部件检字〕"
