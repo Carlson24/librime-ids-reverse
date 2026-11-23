@@ -99,6 +99,36 @@ ok(utf8.char(store:cp_of_id(chun[1])) == "𡗗", "O 春-日 首选 𡗗")
 local pei = hybrid({ "佩", "-亻" })
 ok(utf8.char(store:cp_of_id(pei[1])) == "𫥞", "O 佩-亻 首选 𫥞")
 
+-- 括号分组：外层运算符作用于组内所有部件
+local miao_group = hybrid({ "渺", "-(水少)" })
+ok(utf8.char(store:cp_of_id(miao_group[1])) == "目", "O 渺-(水少) 首选 目")
+local miao_group_raw = hybrid({ "渺-(水少)" })
+ok(utf8.char(store:cp_of_id(miao_group_raw[1])) == "目",
+   "O 渺-(水少) 表达式首选 目")
+
+local sen_group = hybrid({ "森", "-(木木)" })
+ok(utf8.char(store:cp_of_id(sen_group[1])) == "木", "O 森-(木木) 首选 木")
+
+local grouped_excluded = chars(hybrid({ "木木", "!(口日)" }))
+ok(not contains(grouped_excluded, "啉"), "O 木木!(口日) 排除 啉")
+ok(not contains(grouped_excluded, "晽"), "O 木木!(口日) 排除 晽")
+
+local group_steps = I.parse_algebra_steps({ "渺-(水少)" })
+ok(#group_steps == 3 and group_steps[1].item == "渺"
+   and group_steps[1].op == "+"
+   and group_steps[2].item == "水" and group_steps[2].op == "-"
+   and group_steps[3].item == "少" and group_steps[3].op == "-",
+   "括号解析 渺-(水少)")
+
+local excl_steps = I.parse_algebra_steps({ "木木", "!(口日)" })
+ok(#excl_steps == 4 and excl_steps[3].item == "口"
+   and excl_steps[3].op == "!" and excl_steps[4].item == "日"
+   and excl_steps[4].op == "!", "括号解析 木木!(口日)")
+
+ok(I.is_component_expression("渺-(水少)"), "括号表达式合法")
+ok(not I.is_component_expression("渺-(水+少)"), "括号内运算符非法")
+ok(not I.is_component_expression("渺-(水少"), "括号未闭合非法")
+
 local qian_id = store:id_of_cp(utf8.codepoint("芌"))
 local yu_id = store:id_of_cp(utf8.codepoint("芋"))
 local qian_variants = store:variants(qian_id)

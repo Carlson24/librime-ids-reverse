@@ -763,39 +763,60 @@ std::string NormalizeAlgebraItem(IdsStore& store,
 
 // 流式解析操作符：支持任意次 + / - / ! 交替；汉字串按字符拆分为独立运算项。
 // ! 是一次性排除：处理完一个 ! 项后恢复为正向，避免影响后续新选的部件。
+// () 只做分组：括号内不允许运算符，括号前的运算符统一作用于组内所有部件。
 std::vector<AlgebraStep> ParseAlgebraSteps(
     const std::vector<std::string>& components) {
   std::vector<AlgebraStep> steps;
   char curr_op = '+';
+  std::vector<char> groups;
   for (const auto& raw : components) {
     std::string s = StripSpace(raw);
     // 上一条以 ! 结尾时，新条目默认恢复正向；显式运算符仍可覆盖。
-    if (curr_op == '!' && !s.empty() && s[0] != '+' && s[0] != '-' &&
-        s[0] != '!') {
+    if (groups.empty() && curr_op == '!' && !s.empty() && s[0] != '+' &&
+        s[0] != '-' && s[0] != '!' && s[0] != '(') {
       curr_op = '+';
     }
     size_t i = 0;
     while (i < s.size()) {
       char c = s[i];
-      if (c == '+' || c == '-' || c == '!') {
-        curr_op = c;
+      if (c == '(') {
+        groups.push_back(curr_op);
         ++i;
-        continue;
-      }
-      size_t start = i;
-      while (i < s.size() && s[i] != '+' && s[i] != '-' && s[i] != '!')
+      } else if (c == ')') {
+        if (!groups.empty()) {
+          char outer = groups.back();
+          groups.pop_back();
+          if (!groups.empty() && groups.back() == '!')
+            curr_op = '!';
+          else if (outer == '!')
+            curr_op = '+';
+          else
+            curr_op = outer;
+        }
         ++i;
-      std::string item = s.substr(start, i - start);
-      if (item.empty())
-        continue;
-      if (IsAsciiAlphaOnly(item)) {
-        steps.push_back({curr_op, item});
+      } else if (c == '+' || c == '-' || c == '!') {
+        // 括号内不允许运算符；这里防御性忽略，不改变组内默认运算符。
+        if (groups.empty())
+          curr_op = c;
+        ++i;
       } else {
-        for (const auto& ch : Utf8Chars(item))
-          steps.push_back({curr_op, ch});
+        size_t start = i;
+        while (i < s.size() && s[i] != '+' && s[i] != '-' && s[i] != '!' &&
+               s[i] != '(' && s[i] != ')')
+          ++i;
+        std::string item = s.substr(start, i - start);
+        if (item.empty())
+          continue;
+        if (IsAsciiAlphaOnly(item)) {
+          steps.push_back({curr_op, item});
+        } else {
+          for (const auto& ch : Utf8Chars(item))
+            steps.push_back({curr_op, ch});
+        }
+        // ! 在顶层是一次性的；作为括号默认运算符时对整组生效。
+        if (curr_op == '!' && groups.empty())
+          curr_op = '+';
       }
-      if (curr_op == '!')
-        curr_op = '+';
     }
   }
   return steps;

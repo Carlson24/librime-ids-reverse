@@ -718,20 +718,40 @@ bool IsComponentCodePoint(uint32_t cp) {
          (cp >= 0x20000 && cp <= 0x2FA1F) || (cp >= 0x30000 && cp <= 0x323AF);
 }
 
-// 完整汉字表达式，例如 木木!口 / 森-木；不接受 ASCII 拼音。
+// 完整汉字表达式，例如 木木!口 / 森-木 / 渺-(水少)；不接受 ASCII 拼音。
+// 括号内只允许部件，不允许再出现 + / - / !。
 bool IsComponentExpression(const std::string& text) {
   if (text.empty())
     return false;
   size_t count = 0;
   bool has_component = false;
+  int depth = 0;
   size_t i = 0;
   while (i < text.size()) {
     unsigned char c = static_cast<unsigned char>(text[i]);
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
       return false;
+    if (c == '(' || c == ')') {
+      if (c == '(') {
+        ++depth;
+      } else {
+        if (depth == 0)
+          return false;
+        --depth;
+      }
+      ++count;
+      if (count > 32)
+        return false;
+      ++i;
+      continue;
+    }
     if (c == '+' || c == '-' || c == '!') {
+      if (depth > 0)
+        return false;
       ++i;
       ++count;
+      if (count > 32)
+        return false;
       continue;
     }
     if (c < 0x80)
@@ -742,8 +762,10 @@ bool IsComponentExpression(const std::string& text) {
       return false;
     has_component = true;
     ++count;
+    if (count > 32)
+      return false;
   }
-  return has_component && count <= 32;
+  return has_component && depth == 0;
 }
 
 PendingComponents ParsePendingComponents(IdsStore& store,

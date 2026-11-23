@@ -270,22 +270,32 @@ local function is_component_expression(text, max_chars)
   if text == "" or max_chars == 0 or has_whitespace(text) then return false end
   local count = 0
   local has_component = false
+  local depth = 0
   local i, n = 0, #text
   while i < n do
     local cp
     cp, i = decode_next(text, i)
     if cp == 0 then return false end
-    if cp == 0x2B or cp == 0x2D or cp == 0x21 then
+    if cp == 0x28 or cp == 0x29 then
+      if cp == 0x28 then
+        depth = depth + 1
+      else
+        if depth == 0 then return false end
+        depth = depth - 1
+      end
       count = count + 1
-      if count > max_chars then return false end
+    elseif cp == 0x2B or cp == 0x2D or cp == 0x21 then
+      -- 括号内不允许再写运算符；出现即视为非法表达式。
+      if depth > 0 then return false end
+      count = count + 1
     else
       if not is_component_char(cp) then return false end
       has_component = true
       count = count + 1
-      if count > max_chars then return false end
     end
+    if count > max_chars then return false end
   end
-  return has_component
+  return has_component and depth == 0
 end
 
 local function is_component_code_point(cp)
@@ -2428,22 +2438,44 @@ end
 local function parse_algebra_steps(components)
   local steps = {}
   local curr_op = "+"
+  local groups = {}
   for _, raw in ipairs(components) do
     local s = strip_space(raw)
-    if curr_op == "!" and s ~= ""
-       and s:sub(1, 1) ~= "+" and s:sub(1, 1) ~= "-" and s:sub(1, 1) ~= "!" then
+    -- 上一条以 ! 结尾时，新条目默认恢复正向；显式运算符仍可覆盖。
+    -- 括号内不允许运算符，因此只在顶层做一次性的恢复。
+    if #groups == 0 and curr_op == "!" and s ~= ""
+       and s:sub(1, 1) ~= "+" and s:sub(1, 1) ~= "-" and s:sub(1, 1) ~= "!"
+       and s:sub(1, 1) ~= "(" then
       curr_op = "+"
     end
     local i = 1
     while i <= #s do
       local c = s:sub(i, i)
-      if c == "+" or c == "-" or c == "!" then
-        curr_op = c
+      if c == "(" then
+        groups[#groups + 1] = curr_op
+        i = i + 1
+      elseif c == ")" then
+        if #groups > 0 then
+          local outer = groups[#groups]
+          groups[#groups] = nil
+          if #groups > 0 and groups[#groups] == "!" then
+            curr_op = "!"
+          elseif outer == "!" then
+            curr_op = "+"
+          else
+            curr_op = outer
+          end
+        end
+        i = i + 1
+      elseif c == "+" or c == "-" or c == "!" then
+        -- 括号内不允许运算符；这里防御性忽略，不改变组内默认运算符。
+        if #groups == 0 then curr_op = c end
         i = i + 1
       else
         local start = i
         while i <= #s and s:sub(i, i) ~= "+" and s:sub(i, i) ~= "-"
-              and s:sub(i, i) ~= "!" do
+              and s:sub(i, i) ~= "!" and s:sub(i, i) ~= "("
+              and s:sub(i, i) ~= ")" do
           i = i + 1
         end
         local item = s:sub(start, i - 1)
@@ -2456,7 +2488,8 @@ local function parse_algebra_steps(components)
             end
           end
         end
-        if curr_op == "!" then curr_op = "+" end
+        -- ! 在顶层是一次性的；作为括号默认运算符时对整组生效。
+        if curr_op == "!" and #groups == 0 then curr_op = "+" end
       end
     end
   end
@@ -3397,6 +3430,10 @@ local function processor_func(key_event, env)
   local is_exclude = not ctrl and not alt
                      and (code == 0x21 or repr == "!" or repr == "exclam"
                           or (code == 0x31 and shift))
+  local is_lparen = not ctrl and not alt
+                    and (code == 0x28 or repr == "(" or repr == "parenleft")
+  local is_rparen = not ctrl and not alt
+                    and (code == 0x29 or repr == ")" or repr == "parenright")
 
   if is_variant then
     ctx:set_property(VARIANTS_RESULT_PROPERTY, "")
@@ -3442,7 +3479,8 @@ local function processor_func(key_event, env)
     return 1
   end
 
-  if is_letter or is_minus or is_plus or is_exclude then
+  if is_letter or is_minus or is_plus or is_exclude
+     or is_lparen or is_rparen then
     local variant_result = ctx:get_property(VARIANTS_RESULT_PROPERTY)
     if variant_result ~= "" then
       local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
@@ -3468,6 +3506,8 @@ local function processor_func(key_event, env)
     if is_minus then ch = "-"
     elseif is_plus then ch = "+"
     elseif is_exclude then ch = "!"
+    elseif is_lparen then ch = "("
+    elseif is_rparen then ch = ")"
     else ch = repr:sub(1, 1) end
     if ch:match("^[A-Z]$") then ch = ascii_lower(ch) end
     if ctx.caret_pos ~= #ctx.input then ctx.caret_pos = #ctx.input end
@@ -3996,6 +4036,8 @@ M._internal = {
   decode_shuangpin = decode_shuangpin,
   normalize_component = normalize_component,
   parse_pending_components = parse_pending_components,
+  parse_algebra_steps = parse_algebra_steps,
+  is_component_expression = is_component_expression,
   build_multi_component_candidates = build_multi_component_candidates,
   build_variant_candidates = build_variant_candidates,
   clear_query_caches = clear_query_caches,

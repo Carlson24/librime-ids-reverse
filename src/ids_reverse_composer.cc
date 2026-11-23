@@ -487,6 +487,12 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   bool is_exclude = !ctrl && !alt &&
                     (code == XK_exclam || repr == "!" || repr == "exclam" ||
                      (code == XK_1 && shift));
+  bool is_lparen =
+      !ctrl && !alt &&
+      (code == XK_parenleft || repr == "(" || repr == "parenleft");
+  bool is_rparen =
+      !ctrl && !alt &&
+      (code == XK_parenright || repr == ")" || repr == "parenright");
 
   if (is_variant) {
     ctx->set_property(kVariantsResultProperty, "");
@@ -545,7 +551,8 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   if (MatchesVariantReplaceKey(key_event) && TryReplaceVariant(ctx))
     return rime::kAccepted;
 
-  if (is_letter || is_minus || is_plus || is_exclude) {
+  if (is_letter || is_minus || is_plus || is_exclude || is_lparen ||
+      is_rparen) {
     // 异体字替换后继续输入：确保异体字已作为独立部件存在，
     // 让后续运算作用于它，而不是把它留作 pending 原始输入。
     const std::string variant_result =
@@ -575,7 +582,17 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
         ctx->set_input(config_.hybrid.prefix + display + "'");
       }
     }
-    char ch = is_minus ? '-' : (is_plus ? '+' : (is_exclude ? '!' : repr[0]));
+    char ch = repr[0];
+    if (is_minus)
+      ch = '-';
+    else if (is_plus)
+      ch = '+';
+    else if (is_exclude)
+      ch = '!';
+    else if (is_lparen)
+      ch = '(';
+    else if (is_rparen)
+      ch = ')';
     if (ch >= 'A' && ch <= 'Z')
       ch = static_cast<char>(ch - 'A' + 'a');
     if (ctx->caret_pos() != ctx->input().size())
