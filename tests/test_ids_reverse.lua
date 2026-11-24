@@ -56,6 +56,15 @@ ok(I.build_comment(store, wood_id, true, true, true, true, "unicode")
 ok(I.ids_of_text(store, "木") ~= "", "IDS 结构输出")
 
 ok(I.decode_shuangpin(store, "kz", "flypy") == "kou", "flypy 双拼 kz -> kou")
+local mn_segs = I.segment_alpha_string(store, "mn", "flypy")
+ok(#mn_segs == 1 and mn_segs[1] == "miao", "flypy mn -> miao")
+local mn_pending = I.parse_pending_components(store, "mn", "flypy")
+ok(mn_pending.valid and #mn_pending.tokens == 1
+   and mn_pending.tokens[1] == "miao", "pending mn -> miao")
+local miao_ids = I.get_component_candidates(store, "miao", "flypy", 0)
+local miao_chars = chars(miao_ids)
+ok(contains(miao_chars, "渺") and contains(miao_chars, "妙")
+   and contains(miao_chars, "苗"), "miao 部件候选")
 local segs = I.segment_alpha_string(store, "mukou", "quanpin")
 ok(#segs == 2 and segs[1] == "mu" and segs[2] == "kou", "全拼切分 mukou")
 
@@ -69,6 +78,17 @@ end
 local mu_chars = first_component("mu")
 ok(contains(mu_chars, "木") and contains(mu_chars, "目") and contains(mu_chars, "母"),
    "mu 部件候选")
+
+ok(store.version == 3, "数据版本为 IDS4 v3")
+local sha_ids = I.get_component_candidates(store, "sha", "quanpin", 0)
+local sha_chars = chars(sha_ids)
+ok(#sha_ids > 100, "sha 候选数量 > 100")
+ok(contains(sha_chars, "啥") and contains(sha_chars, "砂")
+   and contains(sha_chars, "鲨") and contains(sha_chars, "纱"),
+   "sha 包含 啥/砂/鲨/纱")
+ok(contains(sha_chars, "挲"), "sha 包含异读 挲")
+local sh_prefix = I.get_component_candidates(store, "sh", "quanpin", 10)
+ok(#sh_prefix == 10, "前缀候选保留上限")
 
 local function search(q, mode)
   return I.search_components(store, q, 60, mode or "quanpin", nil)
@@ -162,6 +182,49 @@ ok(#excl_steps == 4 and excl_steps[3].item == "口"
 ok(I.is_component_expression("渺-(水少)"), "括号表达式合法")
 ok(not I.is_component_expression("渺-(水+少)"), "括号内运算符非法")
 ok(not I.is_component_expression("渺-(水少"), "括号未闭合非法")
+
+-- 括号编辑辅助函数
+local run_start, run_end = I.find_last_ascii_run("(沐-mu")
+ok(run_start ~= nil and string.sub("(沐-mu", run_start, run_end) == "mu",
+   "查找最后一个拼音段")
+ok(I.replace_last_ascii_run("(沐-mu", "木") == "(沐-木",
+   "替换最后一个拼音段")
+local open_group = I.parse_single_group("-(shui")
+ok(open_group and open_group.op == "-" and open_group.inner == "shui"
+   and not open_group.closed, "识别未闭合括号表达式")
+local closed_group = I.parse_single_group("-(沐-木)")
+ok(closed_group and closed_group.op == "-" and closed_group.inner == "沐-木"
+   and closed_group.closed, "识别已闭合括号表达式")
+
+local comps, excludes = I.evaluate_algebra_expression(store, "沐-木", "quanpin")
+ok(#comps == 1 and comps[1] == "氵" and #excludes == 0,
+   "括号求值 沐-木 -> 氵")
+comps, excludes = I.evaluate_algebra_expression(store, "森-木", "quanpin")
+ok(#comps == 1 and comps[1] == "林", "括号求值 森-木 -> 林")
+comps, excludes = I.evaluate_algebra_expression(store, "沐!木", "quanpin")
+ok(#comps == 1 and comps[1] == "沐" and #excludes == 1 and excludes[1] == "木",
+   "括号求值 沐!木")
+comps, excludes = I.evaluate_algebra_expression(store, "沐 ' - 木", "quanpin")
+ok(#comps == 1 and comps[1] == "氵", "括号求值忽略分隔符")
+comps, excludes = I.evaluate_algebra_expression(store, "(沐-木)+口", "quanpin")
+ok(#comps == 2 and comps[1] == "氵" and comps[2] == "口",
+   "括号求值支持嵌套")
+ok(I.format_group_component("-", { "氵" }, {}) == "-氵",
+   "括号结果加外层运算符")
+
+-- 模拟 Oshao 选少 → (mu 选沐 → -mu 选木 → ) 的括号编辑流程
+local pending = "(mu"
+pending = I.replace_last_ascii_run(pending, "沐")
+pending = pending .. "-mu"
+pending = I.replace_last_ascii_run(pending, "木")
+local flow_group = I.parse_single_group(pending .. ")")
+ok(flow_group and flow_group.closed and flow_group.inner == "沐-木",
+   "括号编辑流程 沐-木")
+local flow_comps = I.evaluate_algebra_expression(store, flow_group.inner, "quanpin")
+ok(#flow_comps == 1 and flow_comps[1] == "氵", "括号编辑流程求值 氵")
+
+local shao_shui = hybrid({ "少", "氵" })
+ok(utf8.char(store:cp_of_id(shao_shui[1])) == "沙", "O 少+氵 首选 沙")
 
 local qian_id = store:id_of_cp(utf8.codepoint("芌"))
 local yu_id = store:id_of_cp(utf8.codepoint("芋"))

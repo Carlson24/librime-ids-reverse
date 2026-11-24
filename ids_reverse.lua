@@ -33,6 +33,7 @@ local SEC_VAR = 16
 local SEC_TOK_CANON = 17
 local SEC_ATOMIC_SET = 18
 local SEC_LEAF_STRUCT = 19
+local SEC_PY_CHAR = 20
 
 local NO_TOKEN = 0xFFFF
 local INVALID_ID = 0xFFFFFFFF
@@ -422,7 +423,7 @@ function Store.load(path, custom_path)
 
   local magic, version, flags, max_cp, num_chars, nkeys, nsec =
       string.unpack("<c4HHIIII", blob, 1)
-  if version ~= 2 then
+  if version ~= 3 then
     return nil, "old IDS4 data (version " .. tostring(version) ..
                 "), please regenerate ids_data.bin"
   end
@@ -444,7 +445,7 @@ function Store.load(path, custom_path)
   local required = {
     SEC_CP2ID, SEC_ID2CP, SEC_HOT, SEC_COLD_IDX, SEC_ALTS, SEC_LEAVES,
     SEC_ATOMS, SEC_COMPSET, SEC_COLD, SEC_POST, SEC_KEY_LOOKUP, SEC_TOKENS,
-    SEC_PY, SEC_KEY_REC, SEC_LEAF_STRUCT,
+    SEC_PY, SEC_PY_CHAR, SEC_KEY_REC, SEC_LEAF_STRUCT,
   }
   for _, t in ipairs(required) do
     if not self.sections[t] then return nil, "missing section " .. t end
@@ -489,6 +490,9 @@ function Store.load(path, custom_path)
 
   self:parse_tokens()
   self:parse_py()
+  if not self:parse_py_char() then
+    return nil, "bad PY_CHAR section"
+  end
   self:parse_key_recs()
   self:parse_atomic_set()
   self.custom_disabled_blocks = {}
@@ -668,6 +672,34 @@ function Store:parse_py()
     end
     self.py_map[py] = ids
     self.valid_pinyins[py] = true
+  end
+  return true
+end
+
+function Store:parse_py_char()
+  local sec = self.sections[SEC_PY_CHAR]
+  local p = sec.off
+  local endp = sec.off + sec.len
+  if p + 2 > endp then return false end
+  local np = rd16(self.blob, p)
+  p = p + 2
+  self.py_char_map = {}
+  for _ = 1, np do
+    if p + 2 > endp then return false end
+    local len = rd16(self.blob, p)
+    p = p + 2
+    if p + len + 2 > endp then return false end
+    local py = self.blob:sub(p + 1, p + len)
+    p = p + len
+    local m = rd16(self.blob, p)
+    p = p + 2
+    if p + m * 4 > endp then return false end
+    local ids = {}
+    for j = 1, m do
+      ids[j] = rd32(self.blob, p)
+      p = p + 4
+    end
+    self.py_char_map[py] = ids
   end
   return true
 end
@@ -1271,6 +1303,14 @@ local function segment_alpha_string(store, chunk, mode)
     return r
   end
   if mode == "flypy" or mode == "zrm" then
+    -- 2 字母编码优先按双拼解释，避免 "mn" 被全拼切分成 m + n。
+    if #chunk == 2 then
+      local sp = decode_shuangpin_string(store, chunk, mode)
+      if sp and #sp > 0 then
+        cache_put(seg_cache, key, sp, 2048)
+        return sp
+      end
+    end
     local segs = segment_pinyin_optimal(store, chunk)
     if #segs > 0 then
       local all_valid = true
@@ -2678,6 +2718,168 @@ local function apply_single_subtraction(store, current, neg)
   return current
 end
 
+-- ---------------------------------------------------------------------------
+-- 括号表达式求值（只算部件，不查词典）
+-- ---------------------------------------------------------------------------
+
+local function find_last_ascii_run(s)
+  local last_start, last_end
+  local i = 1
+  while i <= #s do
+    local b = s:byte(i)
+    if b and ((b >= 0x41 and b <= 0x5A) or (b >= 0x61 and b <= 0x7A)) then
+      local start = i
+      while i <= #s do
+        local c = s:byte(i)
+        if not c or not ((c >= 0x41 and c <= 0x5A) or (c >= 0x61 and c <= 0x7A)) then
+          break
+        end
+        i = i + 1
+      end
+      last_start, last_end = start, i - 1
+    else
+      i = i + 1
+    end
+  end
+  if last_start then return last_start, last_end end
+  return nil
+end
+
+local function replace_last_ascii_run(s, text)
+  local start_pos, end_pos = find_last_ascii_run(s)
+  if not start_pos then return s end
+  return s:sub(1, start_pos - 1) .. text .. s:sub(end_pos + 1)
+end
+
+-- pending 形如 [op]? ( ... )? 时返回 { op, inner, closed }；否则返回 nil。
+local function parse_single_group(pending)
+  if pending == "" then return nil end
+  local i = 1
+  local op = ""
+  local first = pending:sub(1, 1)
+  if first == "-" or first == "+" or first == "!" then
+    op = first
+    i = 2
+  end
+  if pending:sub(i, i) ~= "(" then return nil end
+  local open_pos = i
+  local depth = 0
+  local close_pos
+  local j = i
+  while j <= #pending do
+    local c = pending:sub(j, j)
+    if c == "(" then
+      depth = depth + 1
+    elseif c == ")" then
+      depth = depth - 1
+      if depth == 0 then
+        close_pos = j
+        break
+      end
+    end
+    j = j + 1
+  end
+  if close_pos then
+    if close_pos ~= #pending then return nil end
+    return { op = op, inner = pending:sub(open_pos + 1, close_pos - 1),
+             closed = true }
+  end
+  return { op = op, inner = pending:sub(open_pos + 1), closed = false }
+end
+
+local function format_group_component(op, components, excludes)
+  local out = table.concat(components)
+  for _, e in ipairs(excludes) do out = out .. "!" .. e end
+  if out == "" then return "" end
+  if op ~= "" then out = op .. out end
+  return out
+end
+
+local function apply_eval_item(store, st, op, raw, mode)
+  local item = normalize_algebra_item(store, raw, mode)
+  if item == "" then return end
+  if op == "+" then
+    st.components[#st.components + 1] = item
+  elseif op == "!" then
+    st.excludes[#st.excludes + 1] = item
+  else
+    st.has_sub = true
+    st.components = apply_single_subtraction(store, st.components, item)
+  end
+end
+
+local function merge_eval_group(store, st, op, inner)
+  st.has_sub = st.has_sub or inner.has_sub
+  for _, item in ipairs(inner.components) do
+    if op == "+" then
+      st.components[#st.components + 1] = item
+    elseif op == "!" then
+      st.excludes[#st.excludes + 1] = item
+    else
+      st.has_sub = true
+      st.components = apply_single_subtraction(store, st.components, item)
+    end
+  end
+  for _, e in ipairs(inner.excludes) do
+    st.excludes[#st.excludes + 1] = e
+  end
+end
+
+local function is_eval_separator(c)
+  return c == "'" or c == " " or c == "\t" or c == "\r" or c == "\n"
+         or c == "." or c == "_"
+end
+
+local function eval_algebra_seq(store, s, i, mode, stop)
+  local st = { components = {}, excludes = {}, has_sub = false }
+  local op = "+"
+  while i <= #s do
+    local c = s:sub(i, i)
+    if c == ")" then
+      if stop then i = i + 1 end
+      break
+    elseif c == "(" then
+      local new_i, inner = eval_algebra_seq(store, s, i + 1, mode, true)
+      merge_eval_group(store, st, op, inner)
+      if op == "!" then op = "+" end
+      i = new_i
+    elseif c == "+" or c == "-" or c == "!" then
+      op = c
+      i = i + 1
+    elseif is_eval_separator(c) then
+      i = i + 1
+    else
+      local start = i
+      while i <= #s do
+        local ch = s:sub(i, i)
+        if ch == "+" or ch == "-" or ch == "!" or ch == "(" or ch == ")"
+           or is_eval_separator(ch) then
+          break
+        end
+        i = i + 1
+      end
+      local item = s:sub(start, i - 1)
+      if item ~= "" then
+        if is_ascii_alpha_only(item) then
+          apply_eval_item(store, st, op, item, mode)
+          if op == "!" then op = "+" end
+        else
+          for _, ch in ipairs(utf8_chars(item)) do
+            apply_eval_item(store, st, op, ch, mode)
+            if op == "!" then op = "+" end
+          end
+        end
+      end
+    end
+  end
+  return i, st
+end
+
+local function evaluate_algebra_expression(store, expression, mode)
+  local _, st = eval_algebra_seq(store, expression, 1, mode, false)
+  return st.components, st.excludes
+end
+
 local function pure_subtraction_results(store, components)
   local results = {}
   local seen_comp, seen_id = {}, {}
@@ -2932,11 +3134,47 @@ local function get_component_candidates(store, raw_code, mode, limit)
   if code == "" then return {} end
   code = ascii_lower(code)
   if not is_ascii_alpha_only(code) then return {} end
+
+  local pcm = store.py_char_map
   local lookup = code
-  if not store.py_map[lookup] and #lookup == 2 then
+  if not ((pcm and pcm[lookup]) or store.py_map[lookup]) and #lookup == 2 then
     local decoded = decode_shuangpin(store, lookup, mode)
     if decoded ~= lookup then lookup = decoded end
   end
+
+  -- v3 数据：完整字符拼音索引优先。精确单音节不设上限。
+  if pcm and next(pcm) then
+    local exact = pcm[lookup]
+    if exact then
+      local ids = {}
+      for i = 1, #exact do ids[i] = exact[i] end
+      return ids
+    end
+    local ids, seen = {}, {}
+    for py, list in pairs(pcm) do
+      if starts_with(py, lookup) then
+        for _, id in ipairs(list) do
+          if not seen[id] then
+            seen[id] = true
+            ids[#ids + 1] = id
+          end
+        end
+      end
+    end
+    table.sort(ids, function(a, b)
+      local fa, fb = store:hot(a).freq, store:hot(b).freq
+      if fa ~= fb then return fa > fb end
+      return a < b
+    end)
+    if limit and limit > 0 and #ids > limit then
+      local r = {}
+      for i = 1, limit do r[i] = ids[i] end
+      ids = r
+    end
+    return ids
+  end
+
+  -- 兼容旧数据（理论上 v3 不允许缺少 PY_CHAR）。
   local tokens
   local pit = store.py_map[lookup]
   if pit then
@@ -2964,7 +3202,7 @@ local function get_component_candidates(store, raw_code, mode, limit)
     end
   end
   table.sort(ids, function(a, b) return store:hot(a).freq > store:hot(b).freq end)
-  if #ids > limit then
+  if limit and limit > 0 and #ids > limit then
     local r = {}
     for i = 1, limit do r[i] = ids[i] end
     ids = r
@@ -3226,6 +3464,30 @@ local function prepare_selected_candidate(seg)
   return seg:get_candidate_at(seg.selected_index)
 end
 
+-- 括号闭合且内部拼音都已消歧后，求值并作为一个部件加入状态。
+local function try_commit_closed_group(ctx, env)
+  if not is_reverse_active(ctx, env.config.hybrid.prefix) then return false end
+  local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+  local group = parse_single_group(st.pending)
+  if not group or not group.closed then return false end
+  if find_last_ascii_run(st.pending) then return false end
+  local store = ensure_store(env.config)
+  if not store then return false end
+  local components, excludes = evaluate_algebra_expression(
+      store, group.inner, pinyin_mode(env.config, ctx))
+  local component = format_group_component(group.op, components, excludes)
+  local base = ctx.input:sub(1, #ctx.input - #st.pending)
+  if component == "" then
+    ctx.input = base
+    return true
+  end
+  st.components[#st.components + 1] = component
+  st.codes[#st.codes + 1] = st.pending
+  save_hybrid_state(ctx, st.components, st.codes)
+  ctx.input = base .. st.pending .. "'"
+  return true
+end
+
 -- ---------------------------------------------------------------------------
 -- Processor
 -- ---------------------------------------------------------------------------
@@ -3384,6 +3646,20 @@ local function on_select(ctx, env)
   end
 
   local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+
+  -- 括号内：只把当前拼音段替换成所选汉字，不提交为状态部件。
+  local group = parse_single_group(st.pending)
+  if group then
+    local run_start = find_last_ascii_run(st.pending)
+    if run_start and component ~= "" then
+      local new_pending = replace_last_ascii_run(st.pending, component)
+      local base = ctx.input:sub(1, #ctx.input - #st.pending)
+      ctx.input = base .. new_pending
+      try_commit_closed_group(ctx, env)
+    end
+    return
+  end
+
   if st.pending ~= "" and component ~= "" then
     local first = st.pending:sub(1, 1)
     if (first == "-" or first == "+" or first == "!")
@@ -3391,10 +3667,11 @@ local function on_select(ctx, env)
       component = first .. component
     end
   end
+  local base = ctx.input:sub(1, #ctx.input - #st.pending)
   st.components[#st.components + 1] = component
-  st.codes[#st.codes + 1] = st.pending
+  st.codes[#st.codes + 1] = component
   save_hybrid_state(ctx, st.components, st.codes)
-  ctx:push_input("'")
+  ctx.input = base .. component .. "'"
 end
 
 local function on_update(ctx, env)
@@ -3453,14 +3730,6 @@ local function processor_func(key_event, env)
 
   enter_o_mode(ctx)
 
-  if not ctrl and not alt and code >= 0x01000100 and code <= 0x0110FFFF then
-    local cp = code - 0x01000000
-    if is_component_char(cp) then
-      ctx:push_input(cp_to_utf8(cp))
-      return 1
-    end
-  end
-
   if code == 0xFF1B or repr == "Escape" then
     ctx:set_property(VARIANTS_PROPERTY, "")
     ctx:set_property(VARIANTS_RESULT_PROPERTY, "")
@@ -3492,8 +3761,14 @@ local function processor_func(key_event, env)
           ctx:confirm_current_selection()
           return 1
         end
+        -- 括号内单字部件也用回车确认，交给 on_select 替换当前拼音段。
+        if parse_single_group(st.pending) then
+          ctx:confirm_current_selection()
+          return 1
+        end
       end
     end
+    if parse_single_group(st.pending) then return 1 end
     if st.pending ~= "" and st.pending ~= "-" and st.pending ~= "+"
        and st.pending ~= "!" then
       if not ctx.composition:empty() then ctx.composition:pop_back() end
@@ -3533,6 +3808,7 @@ local function processor_func(key_event, env)
       end
       ctx:pop_input(pending_bytes)
     elseif #st.components > 0 then
+      local code_len = #st.codes[#st.codes]
       st.components[#st.components] = nil
       st.codes[#st.codes] = nil
       save_hybrid_state(ctx, st.components, st.codes)
@@ -3540,7 +3816,7 @@ local function processor_func(key_event, env)
       if not ctx.composition:empty() then
         ctx.composition:back().status = "kGuess"
       end
-      ctx:pop_input(1)
+      ctx:pop_input(code_len + 1)
     else
       leave_o_mode(ctx)
       ctx:clear()
@@ -3670,6 +3946,7 @@ local function processor_func(key_event, env)
     end
     ctx:set_property(VARIANTS_PROPERTY, "")
     ctx:push_input(ch)
+    if is_rparen then try_commit_closed_group(ctx, env) end
     return 1
   end
 
@@ -4060,6 +4337,24 @@ local function query_hybrid(segment, env)
     return
   end
 
+  -- 括号编辑：只消歧最后一个拼音段，选中后写回 pending。
+  local group = parse_single_group(pending)
+  if group and has_component then
+    local run_start, run_end = find_last_ascii_run(pending)
+    if run_start then
+      local run = pending:sub(run_start, run_end)
+      local mode = pinyin_mode(env.config, ctx)
+      local tokens = segment_alpha_string(store, run, mode)
+      if #tokens >= 2 then
+        build_multi_component_candidates(store, tokens, segment, env.config, ctx)
+      elseif #tokens == 1 then
+        local results = get_component_candidates(store, tokens[1], mode, 80)
+        build_component_candidates(store, results, segment, env.config)
+      end
+    end
+    return
+  end
+
   if (pending == "" or pending == "-" or pending == "+" or pending == "!")
      and #st.components > 0 then
     local results = search_hybrid(store, st.components,
@@ -4190,6 +4485,11 @@ M._internal = {
   normalize_component = normalize_component,
   parse_pending_components = parse_pending_components,
   parse_algebra_steps = parse_algebra_steps,
+  parse_single_group = parse_single_group,
+  find_last_ascii_run = find_last_ascii_run,
+  replace_last_ascii_run = replace_last_ascii_run,
+  evaluate_algebra_expression = evaluate_algebra_expression,
+  format_group_component = format_group_component,
   is_component_expression = is_component_expression,
   build_multi_component_candidates = build_multi_component_candidates,
   build_variant_candidates = build_variant_candidates,

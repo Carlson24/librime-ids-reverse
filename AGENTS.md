@@ -23,6 +23,7 @@ Chinese; preserve that.
 | `src/ids_reverse_composer.{h,cc}` | `IdsReverseProcessor`, `IdsReverseSegmentor`, `IdsReverseFilter`; all key handling. |
 | `src/ids_reverse_translator.{h,cc}` | Translator, I-mode search, O-mode candidate construction, pinyin/shuangpin decoding. |
 | `src/ids_reverse_search.{h,cc}` | O-mode `SearchHybrid` (add/subtract/exclude algebra) and component candidates. |
+| `src/ids_reverse_group.{h,cc}` | O-mode single-group pending parser and group-component formatting helpers. |
 | `ids_reverse.lua` | Whole Lua implementation; exports `processor`/`segmentor`/`translator`/`filter` and `_internal` for tests. |
 | `data/` | Generator, raw input tables, ignored outputs. |
 | `examples/` | Standalone schema and patch templates. |
@@ -105,8 +106,11 @@ Run it from `data/`; all input paths are relative. It reads `IDS_raw.TXT`,
 `wanxiang_charset.dict.yaml`. It writes `ids_index.txt`, `ids_meta.txt`, and
 `ids_data.bin` (~30 MB). These outputs are git-ignored.
 
-- The only supported format is **IDS4 v2** (`IDS4` magic, version 2). IDS4 v1
-  and IDS3 files must be regenerated; loading them fails.
+- The only supported format is **IDS4 v3** (`IDS4` magic, version 3).
+  `PY_CHAR` (section 20) is required; v2/v1 and IDS3 files must be regenerated.
+- `PY_CHAR` maps every toneless pinyin (including `pypinyin` heteronyms) to all
+  character ids, sorted by frequency. Exact single-syllable candidates are not
+  capped; prefix matches keep the caller's limit.
 - The generator emits text intermediates and the binary; do not hand-edit any
   of them.
 - IDS description operators U+2FF0–U+2FFF (including `⿼⿽⾾⿿`) are stripped from
@@ -161,24 +165,43 @@ State lives in the context property `ids_reverse_components`, one
 the input against the prefix and codes and returns the uncommitted `pending`
 text; `SaveHybridState` writes it back.
 
+There is **no direct Chinese-character input** in O mode: Chinese characters
+enter the composition only when a pinyin/shuangpin candidate is selected. A
+selected component replaces its pinyin code in the input and is stored as both
+`component` and `code` (so the preedit shows `Oshao` → `O少`). Components picked
+as a multi-character combo are stored as one layer; Backspace removes
+`len(code) + 1` bytes (the code plus its following quote).
+
 - **Processor**: Return confirms result/multi-char candidates or turns a pending
   code into a component; Backspace removes pending text or the last component;
   `1`–`6` and `;` select; space confirms; `/` starts a variant query;
   `Shift+V` replaces the preedit character with the selected variant;
   letters and `-`/`+`/`!` are pushed as input. `select_notifier` temporarily
   disables `_auto_commit` and commits result candidates itself.
+- **Parentheses** are edited incrementally: while `pending` is a single
+  `[op]? ( ... )?` expression, selecting a component replaces only the last
+  unresolved ASCII pinyin run and does not commit state. When `)` closes the
+  outermost group and no ASCII runs remain, the processor evaluates the inner
+  expression with `EvaluateAlgebraExpression`, stores the remaining components
+  (plus any `!` exclusions) as one component, and pushes a quote.
 - **Segmentor**: emits the prefix segment, confirmed component segments, and a
   pending `hanzi_component` segment; operators get confirmed segments.
 - **Translator** (`QueryHybrid`), in order: variant-result stage, variant query,
-  results for selected components, pending multi-syllable/multi-character
-  candidates, single-component candidates, raw component expressions.
+  single-group editor (component candidates for the last ASCII run), results for
+  selected components, pending multi-syllable/multi-character candidates,
+  single-component candidates, raw component expressions.
 - **Filter**: drops non-plugin candidates, deduplicates component expressions,
   and scans at most 2000 candidates to avoid walking huge dictionaries.
 - **Search**: `SearchHybrid` applies `-`, `+`/`=`, and `!` algebra with `()`
-  grouping (no operators inside parentheses), expands pure subtraction to
-  characters containing the remainder, matches leaves, then ranks. Exact
-  top-level leaf multiset hits from `LEAF_STRUCT` are merged first and scored
-  with the same exact-structure floor as I mode.
+  grouping, expands pure subtraction to characters containing the remainder,
+  matches leaves, then ranks. Exact top-level leaf multiset hits from
+  `LEAF_STRUCT` are merged first and scored with the same exact-structure floor
+  as I mode. Group parentheses are resolved before state entry, so `SearchHybrid`
+  normally receives only paren-free component strings.
+- **Group evaluator**: `EvaluateAlgebraExpression` (C++) /
+  `evaluate_algebra_expression` (Lua) computes `+`/`-`/`!` and nested
+  parentheses over components only, without dictionary lookup. It is used when
+  committing a closed group, not by `SearchHybrid`.
 
 Variants use the properties `ids_reverse_variants` (base character) and
 `ids_reverse_variants_result` (replacement), plus the internal segment tag
@@ -198,12 +221,14 @@ Variants use the properties `ids_reverse_variants` (base character) and
   `KEY_REC`; `POST` holds a ranked `head` plus the full posting (sorted array,
   or bitmap above 1024 entries).
 - `PY` / `TOKENS`: pinyin-to-component and component token tables.
+- `PY_CHAR` (section 20, required): toneless pinyin -> all character ids,
+  including heteronyms, sorted by frequency; feeds O-mode component candidates.
 - `VAR_OFF` / `VAR`: variants; `TOK_CANON` / `ATOMIC_SET`: precomputed sets.
 - `LEAF_STRUCT`: sorted `{hash, id}` records for the canonical top-level leaf
   multiset; query by binary search and verify against `LEAVES` to tolerate hash
   collisions.
 
-Section ids 1–19 are declared in `ids_store.h` (`kSec*`), mirrored by `SEC_*`
+Section ids 1–20 are declared in `ids_store.h` (`kSec*`), mirrored by `SEC_*`
 in `ids_reverse.lua`, and written by `data/generate_data_v4.py`. Any storage
 change must update all three and regenerate the binary.
 
@@ -220,6 +245,7 @@ one changed. Applies to:
 
 - Config keys, defaults, and fallback rules.
 - Pinyin segmentation and flypy/zrm shuangpin decoders.
+- O-mode component candidate sources, `PY_CHAR` exact/prefix rules, and limits.
 - Query parsing, matching, scoring, and result limits.
 - Candidate types (`ids_reverse`, `hanzi_result`, `hanzi_component`), text,
   preedit, comments, and quality.
@@ -240,6 +266,12 @@ one changed. Applies to:
   Lua; keep them identical.
 - `disabled_blocks` is the union of config values and rules merged from the
   custom file.
+- `valid_pinyins` is the standard pinyin set used for full-pinyin segmentation
+  and shuangpin validation. Do **not** insert `PY_CHAR` keys into it: PY_CHAR
+  includes heteronym/interjection readings such as `m`/`n`, which would make
+  `mn` segment as `m + n` instead of decoding to `miao`.
+- For flypy/zrm, 2-letter chunks are decoded as shuangpin before full-pinyin
+  segmentation; keep this rule when changing `SegmentAlphaString`.
 - Relative data/custom paths resolve first in the user data directory, then the
   shared data directory.
 - Preserve Chinese prompts and candidate comments.
@@ -260,13 +292,14 @@ one changed. Applies to:
 | Add component alias | C++ `CanonMap`, generator `EQUIV_GROUPS`, Lua `CANON_MAP` |
 | Add block name/alias | `ids_store.cc`, both `kBlockNames`, Lua tables, dump script |
 | Change search/ranking | `src/ids_reverse_translator.cc` (`SearchComponents`, `ScoreCandidate`) and/or `src/ids_reverse_search.cc` (`SearchHybrid`), plus Lua equivalents |
+| Change O-mode group editing | `src/ids_reverse_group.{h,cc}`, composer `OnSelectAfter`/`ProcessKeyEvent`, translator `QueryHybrid`, `EvaluateAlgebraExpression`, plus Lua equivalents |
 
 ## Before committing
 
 - Run the Lua functional test.
 - If the binary format or data inputs changed, regenerate `ids_data.bin` and
-  verify with `dump_ids_v4.py`. IDS4 v2 requires `LEAF_STRUCT` with one record
-  per character.
+  verify with `dump_ids_v4.py`. IDS4 v3 requires `LEAF_STRUCT` with one record
+  per character and a non-empty `PY_CHAR` section.
 - If C++ changed, build the target and smoke-test the README scenarios in a
   frontend.
 - Do not commit `*.bin`, `ids_index.txt`, `ids_meta.txt`, or generated dump
