@@ -92,7 +92,7 @@ size_t Utf8Length(const std::string& s) {
 }
 
 bool IsIdc(uint32_t cp) {
-  return cp >= 0x2FF0 && cp <= 0x2FFB;
+  return cp >= 0x2FF0 && cp <= 0x2FFF;
 }
 
 bool HasWhitespace(const std::string& s) {
@@ -105,7 +105,7 @@ bool HasWhitespace(const std::string& s) {
 
 bool IsComponentChar(uint32_t cp) {
   // 排除 IDS 结构符。
-  if (cp >= 0x2FF0 && cp <= 0x2FFB)
+  if (cp >= 0x2FF0 && cp <= 0x2FFF)
     return false;
   return (cp >= 0x2E80 && cp <= 0x2FDF) ||    // 部首补充、康熙部首
          (cp >= 0x31C0 && cp <= 0x31EF) ||    // 笔画
@@ -195,7 +195,8 @@ std::string FormatIds(const std::string& raw_ids, const std::string& format) {
       if (format == "bracket") {
         static const char* kIdcLabels[] = {
             "[左右]", "[上下]", "[左中右]", "[上中下]", "[全包]",   "[上包]",
-            "[下包]", "[左包]", "[左上包]", "[右上包]", "[左下包]", "[交叉]"};
+            "[下包]", "[左包]", "[左上包]", "[右上包]", "[左下包]", "[交叉]",
+            "[右包]", "[右下包]", "[水平翻转]", "[旋转]"};
         out += kIdcLabels[cp - 0x2FF0];
       } else if (format == "plain") {
         // 省略结构符

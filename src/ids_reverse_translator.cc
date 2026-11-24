@@ -185,11 +185,12 @@ std::string FormatIds(const std::string& raw_ids, const std::string& format) {
   while (i < n) {
     size_t old = i;
     uint32_t cp = DecodeNext(raw_ids, &i);
-    if (cp >= 0x2FF0 && cp <= 0x2FFB) {
+    if (cp >= 0x2FF0 && cp <= 0x2FFF) {
       if (format == "bracket") {
         static const char* kIdcLabels[] = {
             "[左右]", "[上下]", "[左中右]", "[上中下]", "[全包]",   "[上包]",
-            "[下包]", "[左包]", "[左上包]", "[右上包]", "[左下包]", "[交叉]"};
+            "[下包]", "[左包]", "[左上包]", "[右上包]", "[左下包]", "[交叉]",
+            "[右包]", "[右下包]", "[水平翻转]", "[旋转]"};
         out += kIdcLabels[cp - 0x2FF0];
       } else if (format == "plain") {
         // 直接省略 IDC 结构字符
@@ -710,7 +711,7 @@ bool IsPendingSeparator(unsigned char c) {
 // 与 ids_text.cc 的 IsComponentChar 保持一致；此处避免包含 ids_text.h
 // 造成与匿名命名空间内同名帮助函数的歧义。
 bool IsComponentCodePoint(uint32_t cp) {
-  if (cp >= 0x2FF0 && cp <= 0x2FFB)
+  if (cp >= 0x2FF0 && cp <= 0x2FFF)
     return false;
   return (cp >= 0x2E80 && cp <= 0x2FDF) || (cp >= 0x31C0 && cp <= 0x31EF) ||
          cp == 0x3007 || (cp >= 0x3400 && cp <= 0x4DBF) ||
@@ -1460,6 +1461,60 @@ std::vector<uint32_t> GetCandidatesForTermFull(
 // 主检索
 // ---------------------------------------------------------------------------
 
+bool BuildLeafStructTokens(IdsStore& store,
+                           const ParsedQuery& pq,
+                           std::vector<uint16_t>* out) {
+  out->clear();
+  for (const auto& term : pq.order) {
+    uint16_t t = store.ResolveTerm(term);
+    if (t == kNoToken)
+      return false;
+    int count = pq.counts.at(term);
+    for (int i = 0; i < count; ++i)
+      out->push_back(t);
+  }
+  return !out->empty();
+}
+
+std::vector<uint32_t> LookupExactStructure(
+    IdsStore& store,
+    const ParsedQuery& pq,
+    const hash_set<int>* disabled_blocks) {
+  std::vector<uint16_t> tokens;
+  if (!BuildLeafStructTokens(store, pq, &tokens))
+    return {};
+  std::vector<uint32_t> ids = store.LookupLeafStructure(tokens);
+  if (disabled_blocks) {
+    ids.erase(std::remove_if(ids.begin(), ids.end(),
+                             [&](uint32_t id) {
+                               return disabled_blocks->count(static_cast<int>(
+                                          store.Hot(id).block)) > 0;
+                             }),
+              ids.end());
+  }
+  return ids;
+}
+
+// 把精确结构候选放到最前，并返回其集合供打分保底使用。
+std::vector<uint32_t> MergeExactFirst(const std::vector<uint32_t>& exact,
+                                      std::vector<uint32_t> broad,
+                                      hash_set<uint32_t>* exact_set) {
+  exact_set->clear();
+  exact_set->reserve(exact.size());
+  std::vector<uint32_t> merged;
+  merged.reserve(exact.size() + broad.size());
+  for (uint32_t id : exact) {
+    if (exact_set->insert(id).second)
+      merged.push_back(id);
+  }
+  hash_set<uint32_t> seen = *exact_set;
+  for (uint32_t id : broad) {
+    if (seen.insert(id).second)
+      merged.push_back(id);
+  }
+  return merged;
+}
+
 LruCache<std::string, std::vector<uint32_t>> g_query_cache(256);
 
 std::vector<uint32_t> SearchComponents(IdsStore& store,
@@ -1508,6 +1563,10 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
     std::vector<uint32_t> cands =
         GetCandidatesForTerm(store, term, pq.counts.at(term), limit, nullptr,
                              disabled_blocks, /*is_multi_term=*/false);
+    std::vector<uint32_t> exact =
+        LookupExactStructure(store, pq, disabled_blocks);
+    hash_set<uint32_t> exact_set;
+    cands = MergeExactFirst(exact, std::move(cands), &exact_set);
     if (cands.empty())
       return {};
 
@@ -1523,6 +1582,8 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
           sc = 40000000 + f - rit->second * 10;
         }
       }
+      if (exact_set.count(id))
+        sc = BoostExactStructureScore(sc);
       scored.push_back({id, sc});
     }
     std::sort(scored.begin(), scored.end(),
@@ -1590,8 +1651,6 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
     // 精确多项查询完整取 base 候选项，避免大 posting 按 id 截断造成漏字。
     current = GetCandidatesForTermFull(store, *base, disabled_blocks);
   }
-  if (current.empty())
-    return {};
 
   for (const auto& sp : terms_info) {
     if (current.empty())
@@ -1633,17 +1692,26 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
     }
     current.swap(filtered);
   }
+  std::vector<uint32_t> exact =
+      LookupExactStructure(store, pq, disabled_blocks);
+  hash_set<uint32_t> exact_set;
+  current = MergeExactFirst(exact, std::move(current), &exact_set);
   if (current.empty())
     return {};
 
   uint32_t score_limit = has_any_pref ? 500 : 1500;
+  if (!exact_set.empty())
+    score_limit += static_cast<uint32_t>(exact_set.size());
   std::vector<std::pair<uint32_t, int64_t>> scored;
   size_t n_score =
       std::min<size_t>(current.size(), static_cast<size_t>(score_limit));
   scored.reserve(n_score);
-  for (size_t i = 0; i < n_score; ++i)
-    scored.push_back(
-        {current[i], ScoreCandidate(store, current[i], matchers, order_count)});
+  for (size_t i = 0; i < n_score; ++i) {
+    int64_t sc = ScoreCandidate(store, current[i], matchers, order_count);
+    if (exact_set.count(current[i]))
+      sc = BoostExactStructureScore(sc);
+    scored.push_back({current[i], sc});
+  }
   std::sort(scored.begin(), scored.end(),
             [](const std::pair<uint32_t, int64_t>& a,
                const std::pair<uint32_t, int64_t>& b) {

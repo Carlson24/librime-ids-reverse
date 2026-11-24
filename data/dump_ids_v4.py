@@ -18,6 +18,7 @@ SECTION_NAMES = {
     6: "LEAVES", 7: "ATOMS", 8: "COMPSET", 9: "COLD", 10: "TOKENS",
     11: "PY", 12: "KEY_LOOKUP", 13: "KEY_REC", 14: "POST",
     15: "VAR_OFF", 16: "VAR", 17: "TOK_CANON", 18: "ATOMIC_SET",
+    19: "LEAF_STRUCT",
 }
 
 
@@ -52,6 +53,15 @@ def dump_ids4(bin_path, output_path=None, sample_count=None):
         sections[sec_type] = (off, length)
         name = SECTION_NAMES.get(sec_type, str(sec_type))
         print(f"  [{name:12s}] off={off:>9} len={length:>10}")
+
+    if 19 in sections:
+        off, length = sections[19]
+        ls_count = struct.unpack('<I', blob[off:off + 4])[0]
+        hashes = set()
+        for i in range(ls_count):
+            h = struct.unpack('<I', blob[off + 4 + i * 8:off + 8 + i * 8])[0]
+            hashes.add(h)
+        print(f"  LEAF_STRUCT: {ls_count} records, {len(hashes)} unique hashes")
 
     id2cp_off, _ = sections[2]
     char_off, _ = sections[3]

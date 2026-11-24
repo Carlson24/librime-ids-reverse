@@ -32,9 +32,19 @@ local SEC_VAR_OFF = 15
 local SEC_VAR = 16
 local SEC_TOK_CANON = 17
 local SEC_ATOMIC_SET = 18
+local SEC_LEAF_STRUCT = 19
 
 local NO_TOKEN = 0xFFFF
 local INVALID_ID = 0xFFFFFFFF
+
+local EXACT_STRUCTURE_BONUS = 20000000
+local EXACT_STRUCTURE_FLOOR = 70000000
+
+local function boost_exact_structure(score)
+  score = score + EXACT_STRUCTURE_BONUS
+  if score < EXACT_STRUCTURE_FLOOR then score = EXACT_STRUCTURE_FLOOR end
+  return score
+end
 
 local HYBRID_STATE_PROPERTY = "ids_reverse_components"
 local VARIANTS_PROPERTY = "ids_reverse_variants"
@@ -53,6 +63,7 @@ local IDC_LABELS = {
   [0] = "[左右]", [1] = "[上下]", [2] = "[左中右]", [3] = "[上中下]",
   [4] = "[全包]", [5] = "[上包]", [6] = "[下包]", [7] = "[左包]",
   [8] = "[左上包]", [9] = "[右上包]", [10] = "[左下包]", [11] = "[交叉]",
+  [12] = "[右包]", [13] = "[右下包]", [14] = "[水平翻转]", [15] = "[旋转]",
 }
 
 local function log_error(msg)
@@ -160,7 +171,7 @@ local function last_utf8_char_bytes(s)
 end
 
 local function is_idc(cp)
-  return cp >= 0x2FF0 and cp <= 0x2FFB
+  return cp >= 0x2FF0 and cp <= 0x2FFF
 end
 
 local function is_component_char(cp)
@@ -331,6 +342,19 @@ local function rd8(blob, off)
   return string.byte(blob, off + 1)
 end
 
+local function leaf_struct_hash(tokens)
+  local h = 2166136261
+  local n = #tokens
+  h = (h ~ (n & 0xFF)) * 16777619 & 0xFFFFFFFF
+  h = (h ~ ((n >> 8) & 0xFF)) * 16777619 & 0xFFFFFFFF
+  for i = 1, n do
+    local t = tokens[i]
+    h = (h ~ (t & 0xFF)) * 16777619 & 0xFFFFFFFF
+    h = (h ~ ((t >> 8) & 0xFF)) * 16777619 & 0xFFFFFFFF
+  end
+  return h
+end
+
 local TOKEN_ARRAY_FORMAT = {}
 local U32_ARRAY_FORMAT = {}
 
@@ -398,6 +422,10 @@ function Store.load(path, custom_path)
 
   local magic, version, flags, max_cp, num_chars, nkeys, nsec =
       string.unpack("<c4HHIIII", blob, 1)
+  if version ~= 2 then
+    return nil, "old IDS4 data (version " .. tostring(version) ..
+                "), please regenerate ids_data.bin"
+  end
   self.version = version
   self.flags = flags
   self.max_cp = max_cp
@@ -416,7 +444,7 @@ function Store.load(path, custom_path)
   local required = {
     SEC_CP2ID, SEC_ID2CP, SEC_HOT, SEC_COLD_IDX, SEC_ALTS, SEC_LEAVES,
     SEC_ATOMS, SEC_COMPSET, SEC_COLD, SEC_POST, SEC_KEY_LOOKUP, SEC_TOKENS,
-    SEC_PY, SEC_KEY_REC,
+    SEC_PY, SEC_KEY_REC, SEC_LEAF_STRUCT,
   }
   for _, t in ipairs(required) do
     if not self.sections[t] then return nil, "missing section " .. t end
@@ -445,6 +473,11 @@ function Store.load(path, custom_path)
   end
   if self.sections[SEC_ATOMIC_SET] then
     self.atomic_set_off = self.sections[SEC_ATOMIC_SET].off
+  end
+  self.leaf_struct_off = self.sections[SEC_LEAF_STRUCT].off
+  self.leaf_struct_count = rd32(blob, self.leaf_struct_off)
+  if 4 + self.leaf_struct_count * 8 > self.sections[SEC_LEAF_STRUCT].len then
+    return nil, "bad LEAF_STRUCT section"
   end
 
   self.hot_cache = {}
@@ -531,6 +564,39 @@ function Store:leaves(id)
   local h = self:hot(id)
   local out = read_token_array(self.blob, self.leaves_off + h.leaf_off)
   self.leaves_cache[id] = out
+  return out
+end
+
+function Store:lookup_leaf_structure(tokens)
+  local out = {}
+  if not tokens or #tokens == 0 then return out end
+  local want = {}
+  for i = 1, #tokens do want[i] = self:canon_token(tokens[i]) end
+  table.sort(want)
+  local hash = leaf_struct_hash(want)
+  local lo, hi = 0, self.leaf_struct_count
+  while lo < hi do
+    local mid = lo + (hi - lo) // 2
+    local h = rd32(self.blob, self.leaf_struct_off + 4 + mid * 8)
+    if h < hash then lo = mid + 1 else hi = mid end
+  end
+  local got = {}
+  for i = lo, self.leaf_struct_count - 1 do
+    local base = self.leaf_struct_off + 4 + i * 8
+    if rd32(self.blob, base) ~= hash then break end
+    local id = rd32(self.blob, base + 4)
+    local lv = self:leaves(id)
+    if #lv == #want then
+      got = {}
+      for j = 1, #lv do got[j] = self:canon_token(lv[j]) end
+      table.sort(got)
+      local same = true
+      for j = 1, #want do
+        if got[j] ~= want[j] then same = false; break end
+      end
+      if same then out[#out + 1] = id end
+    end
+  end
   return out
 end
 
@@ -1788,6 +1854,45 @@ local function disabled_cache_key(disabled)
   return ":blk=" .. table.concat(ks, ",")
 end
 
+local function lookup_exact_query(store, pq, disabled_blocks)
+  local tokens = {}
+  for _, term in ipairs(pq.order) do
+    local t = store:resolve_term(term)
+    if t == nil then return {} end
+    for _ = 1, pq.counts[term] do tokens[#tokens + 1] = t end
+  end
+  if #tokens == 0 then return {} end
+  local ids = store:lookup_leaf_structure(tokens)
+  if disabled_blocks then
+    local filtered = {}
+    for _, id in ipairs(ids) do
+      if not disabled_blocks[store:hot(id).block] then
+        filtered[#filtered + 1] = id
+      end
+    end
+    ids = filtered
+  end
+  return ids
+end
+
+local function merge_exact_first(exact, broad)
+  local exact_set, seen, merged = {}, {}, {}
+  for _, id in ipairs(exact) do
+    if not exact_set[id] then
+      exact_set[id] = true
+      seen[id] = true
+      merged[#merged + 1] = id
+    end
+  end
+  for _, id in ipairs(broad) do
+    if not seen[id] then
+      seen[id] = true
+      merged[#merged + 1] = id
+    end
+  end
+  return merged, exact_set
+end
+
 local function search_components(store, query_str, max_results, mode,
                                  disabled_blocks)
   if query_str == "" then return {} end
@@ -1814,6 +1919,9 @@ local function search_components(store, query_str, max_results, mode,
                          or math.max(480, max_results * 8)
     local cands = get_candidates_for_term(store, term, pq.counts[term], limit,
                                           nil, disabled_blocks, false)
+    local exact = lookup_exact_query(store, pq, disabled_blocks)
+    local exact_set
+    cands, exact_set = merge_exact_first(exact, cands)
     if #cands == 0 then
       cache_put(query_cache, cache_key, {}, 256)
       return {}
@@ -1828,6 +1936,7 @@ local function search_components(store, query_str, max_results, mode,
           sc = 40000000 + store:hot(id).freq - r * 10
         end
       end
+      if exact_set[id] then sc = boost_exact_structure(sc) end
       scored[#scored + 1] = { id = id, score = sc }
     end
     table.sort(scored, function(a, b) return a.score > b.score end)
@@ -1897,14 +2006,20 @@ local function search_components(store, query_str, max_results, mode,
       current = filtered
     end
   end
+  local exact = lookup_exact_query(store, pq, disabled_blocks)
+  local exact_set
+  current, exact_set = merge_exact_first(exact, current)
   if #current == 0 then return {} end
 
   local score_limit = has_any_pref and 500 or 1500
+  local exact_count = 0
+  for _ in pairs(exact_set) do exact_count = exact_count + 1 end
+  score_limit = score_limit + exact_count
   local scored = {}
   for i = 1, math.min(#current, score_limit) do
-    scored[#scored + 1] = { id = current[i],
-                            score = score_candidate(store, current[i],
-                                                    matchers, order_count) }
+    local sc = score_candidate(store, current[i], matchers, order_count)
+    if exact_set[current[i]] then sc = boost_exact_structure(sc) end
+    scored[#scored + 1] = { id = current[i], score = sc }
   end
   table.sort(scored, function(a, b) return a.score > b.score end)
   local results = {}
@@ -2373,7 +2488,8 @@ local function score_hybrid_strings(store, id, normalized, user_atomics,
   return score
 end
 
-local function rank_hybrid_strings(store, cands, normalized)
+local function rank_hybrid_strings(store, cands, normalized, exact_ids,
+                                   score_limit)
   local user_atomics = {}
   local user_atomic_seq = {}
   local cache = {}
@@ -2388,15 +2504,15 @@ local function rank_hybrid_strings(store, cands, normalized)
     end
   end
 
-  local limit = math.min(#cands, 500)
+  local limit = math.min(#cands, score_limit or 500)
   local scored = {}
   for i = 1, limit do
-    scored[#scored + 1] = {
-      id = cands[i],
-      score = score_hybrid_strings(store, cands[i], norm_input, user_atomics,
-                                   user_atomic_seq, cache),
-      index = i,
-    }
+    local sc = score_hybrid_strings(store, cands[i], norm_input, user_atomics,
+                                    user_atomic_seq, cache)
+    if exact_ids and exact_ids[cands[i]] then
+      sc = boost_exact_structure(sc)
+    end
+    scored[#scored + 1] = { id = cands[i], score = sc, index = i }
   end
   table.sort(scored, function(a, b)
     if a.score ~= b.score then return a.score > b.score end
@@ -2408,16 +2524,20 @@ local function rank_hybrid_strings(store, cands, normalized)
   return out
 end
 
-local function rank_hybrid(store, cands, normalized)
+local function rank_hybrid(store, cands, normalized, exact_ids, score_limit)
   if #cands <= 1 or #normalized == 0 then return cands end
   local q = build_query_atoms(store, normalized)
-  if not q then return rank_hybrid_strings(store, cands, normalized) end
-  local limit = math.min(#cands, 500)
+  if not q then
+    return rank_hybrid_strings(store, cands, normalized, exact_ids, score_limit)
+  end
+  local limit = math.min(#cands, score_limit or 500)
   local scored = {}
   for i = 1, limit do
-    scored[#scored + 1] = { id = cands[i],
-                            score = score_hybrid_tokens(store, cands[i], q),
-                            index = i }
+    local sc = score_hybrid_tokens(store, cands[i], q)
+    if exact_ids and exact_ids[cands[i]] then
+      sc = boost_exact_structure(sc)
+    end
+    scored[#scored + 1] = { id = cands[i], score = sc, index = i }
   end
   table.sort(scored, function(a, b)
     if a.score ~= b.score then return a.score > b.score end
@@ -2652,6 +2772,27 @@ local function remove_excluded(store, entries, ids)
   return out
 end
 
+local function lookup_exact_structure(store, normalized, disabled_blocks)
+  local tokens = {}
+  for _, n in ipairs(normalized) do
+    local t = store:resolve_term(n)
+    if t == nil then return {} end
+    tokens[#tokens + 1] = t
+  end
+  if #tokens == 0 then return {} end
+  local ids = store:lookup_leaf_structure(tokens)
+  if disabled_blocks then
+    local filtered = {}
+    for _, id in ipairs(ids) do
+      if not disabled_blocks[store:hot(id).block] then
+        filtered[#filtered + 1] = id
+      end
+    end
+    ids = filtered
+  end
+  return ids
+end
+
 local function search_by_leaves(store, leaves, mode, max_results,
                                 disabled_blocks, exclude_entries)
   local normalized = {}
@@ -2705,7 +2846,19 @@ local function search_by_leaves(store, leaves, mode, max_results,
     cands = filtered
   end
   cands = remove_excluded(store, exclude_entries, cands)
-  cands = rank_hybrid(store, cands, normalized)
+
+  local exact = lookup_exact_structure(store, normalized, disabled_blocks)
+  exact = remove_excluded(store, exclude_entries, exact)
+  local exact_set
+  cands, exact_set = merge_exact_first(exact, cands)
+  local exact_count = 0
+  for _ in pairs(exact_set) do exact_count = exact_count + 1 end
+  local score_limit = 500
+  if exact_count > 0 then
+    score_limit = math.min(#cands, 500 + exact_count)
+  end
+  cands = rank_hybrid(store, cands, normalized,
+                      exact_count > 0 and exact_set or nil, score_limit)
   if #cands > max_results then
     local r = {}
     for i = 1, max_results do r[i] = cands[i] end
@@ -4041,6 +4194,7 @@ M._internal = {
   build_multi_component_candidates = build_multi_component_candidates,
   build_variant_candidates = build_variant_candidates,
   clear_query_caches = clear_query_caches,
+  leaf_struct_hash = leaf_struct_hash,
 }
 
 return M

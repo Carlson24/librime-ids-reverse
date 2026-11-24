@@ -105,10 +105,15 @@ Run it from `data/`; all input paths are relative. It reads `IDS_raw.TXT`,
 `wanxiang_charset.dict.yaml`. It writes `ids_index.txt`, `ids_meta.txt`, and
 `ids_data.bin` (~30 MB). These outputs are git-ignored.
 
-- The only supported format is **IDS4** (`IDS4` magic). IDS3 files must be
-  regenerated; loading them fails.
+- The only supported format is **IDS4 v2** (`IDS4` magic, version 2). IDS4 v1
+  and IDS3 files must be regenerated; loading them fails.
 - The generator emits text intermediates and the binary; do not hand-edit any
   of them.
+- IDS description operators U+2FF0–U+2FFF (including `⿼⿽⾾⿿`) are stripped from
+  LEAVES; the generator also strips its `idc` placeholder/variation markers.
+  Keep at least the U+2FF0–U+2FFF range synchronized between the generator,
+  `IsIdc` / `is_idc`, and the bracket-format label tables. In particular U+2FFF
+  (`⿿`, rotation) is a unary operator, not a component.
 - `ids_custom.txt` is optional runtime customization, not generator input. It
   supports `#` comments, `-block`/`-区` to disable blocks, `-pinyin` to delete
   a reading, `部件 拼音...` to add mappings, and `=` to replace mappings.
@@ -145,7 +150,9 @@ load ~30 MB of data in a component constructor.
 
 `SearchComponents` handles components, full pinyin, and shuangpin; stems are
 ANDed, then scored (`ScoreCandidate`) by direct/ordered match, atomic-match
-tier, frequency, and depth.
+tier, frequency, and depth. Component queries also inject exact top-level leaf
+multiset hits from `LEAF_STRUCT` ahead of the normal candidate pool; these hits
+receive a score floor so they are not displaced by high-frequency ALTS matches.
 
 ### O mode (hybrid)
 
@@ -169,7 +176,9 @@ text; `SaveHybridState` writes it back.
   and scans at most 2000 candidates to avoid walking huge dictionaries.
 - **Search**: `SearchHybrid` applies `-`, `+`/`=`, and `!` algebra with `()`
   grouping (no operators inside parentheses), expands pure subtraction to
-  characters containing the remainder, matches leaves, then ranks.
+  characters containing the remainder, matches leaves, then ranks. Exact
+  top-level leaf multiset hits from `LEAF_STRUCT` are merged first and scored
+  with the same exact-structure floor as I mode.
 
 Variants use the properties `ids_reverse_variants` (base character) and
 `ids_reverse_variants_result` (replacement), plus the internal segment tag
@@ -190,10 +199,19 @@ Variants use the properties `ids_reverse_variants` (base character) and
   or bitmap above 1024 entries).
 - `PY` / `TOKENS`: pinyin-to-component and component token tables.
 - `VAR_OFF` / `VAR`: variants; `TOK_CANON` / `ATOMIC_SET`: precomputed sets.
+- `LEAF_STRUCT`: sorted `{hash, id}` records for the canonical top-level leaf
+  multiset; query by binary search and verify against `LEAVES` to tolerate hash
+  collisions.
 
-Section ids 1–18 are declared in `ids_store.h` (`kSec*`), mirrored by `SEC_*`
+Section ids 1–19 are declared in `ids_store.h` (`kSec*`), mirrored by `SEC_*`
 in `ids_reverse.lua`, and written by `data/generate_data_v4.py`. Any storage
 change must update all three and regenerate the binary.
+
+`LEAF_STRUCT` (section 19) is the canonical top-level leaf multiset index. It
+maps `(len + sorted canonical leaf tokens) -> character ids` and must stay in
+sync across the generator, `IdsStore::LookupLeafStructure`, and
+`Store:lookup_leaf_structure`. Exact structure hits are injected ahead of the
+normal candidate pool and given a score floor in both O and I modes.
 
 ## Keeping C++ and Lua in sync
 
@@ -247,7 +265,8 @@ one changed. Applies to:
 
 - Run the Lua functional test.
 - If the binary format or data inputs changed, regenerate `ids_data.bin` and
-  verify with `dump_ids_v4.py`.
+  verify with `dump_ids_v4.py`. IDS4 v2 requires `LEAF_STRUCT` with one record
+  per character.
 - If C++ changed, build the target and smoke-test the README scenarios in a
   frontend.
 - Do not commit `*.bin`, `ids_index.txt`, `ids_meta.txt`, or generated dump

@@ -15,10 +15,12 @@ Lua 5.5 版见下文「Lua 5.5 版本」。
 
 ---
 
-## 数据格式（IDS4）
+## 数据格式（IDS4 v2）
 
-单文件 `ids_data.bin`（约 29MB），面向**查询延迟**设计：`mmap` 惰性映射、
+单文件 `ids_data.bin`（约 30MB），面向**查询延迟**设计：`mmap` 惰性映射、
 稠密字 id、整数部件匹配、预计算叶子/原子部件、整数倒排键、每键连续 postings。
+
+> IDS4 v1 不含结构索引，读取时会要求重新生成 `ids_data.bin`。
 
 - **稠密 id**：103k+ 汉字映射到 `0..N-1`（`CP2ID`/`ID2CP`）。
 - **CHAR**：每字 24 字节定长记录 `{freq, flags, char_token, depth, block,
@@ -29,7 +31,9 @@ Lua 5.5 版见下文「Lua 5.5 版本」。
   - `LEAVES`：每字顶层部件 token 序列，替代运行时 UTF-8 IDS 拆字；
   - `ATOMS`：每字原子部件 token 序列，替代运行时 `std::map<string,int>` 分解；
   - `TOK_CANON`：token → 归一化 token 直查表；
-  - `ATOMIC_SET`：原子部件 token 集合，生成器与运行时共用。
+  - `ATOMIC_SET`：原子部件 token 集合，生成器与运行时共用；
+  - `LEAF_STRUCT`：顶层叶子多重集 hash → 字 id 的结构索引，用于“只包含这些
+    部件”的精确结构候选，不受字频 head 和普通排序上限影响。
 - **倒排**：
   - `KEY_LOOKUP`/`KEY_REC`：按 `token_id + 重数` 直接寻址，不再哈希字符串键；
   - `POST`：每个键的 `head` 与完整集合连续存放；完整集合大键用**位图**、
@@ -38,8 +42,8 @@ Lua 5.5 版见下文「Lua 5.5 版本」。
 - **PY/TOKENS**：拼音→token、token 词表（含码点）。
 
 区间（section）采用节表，全部定长、小端、8 字节对齐，并按冷热排序：
-`CHAR → CP2ID → KEY_* → TOKENS → LEAVES/ATOMS → ALTS/COMPSET → POST →
-COLD → VAR → ID2CP`。
+`CHAR → CP2ID → KEY_* → TOKENS → LEAVES/ATOMS/LEAF_STRUCT → ALTS/COMPSET →
+POST → COLD → VAR → ID2CP`。
 
 ---
 
@@ -302,6 +306,9 @@ ids_reverse:
   继续输入 `-` 等运算符时，会以该异体字为部件继续运算，例如 `O葵/` 替换后输入
   `-cao`。
 - 使用 `hybrid_prefix`、`hybrid_tag`、`hybrid_tips`。
+- **纯结构优先**：只包含查询部件的字由 `LEAF_STRUCT` 结构索引直接置顶，不受字频
+  head 影响。例如 `O了` 的 `𠄏`（`⿿了`，旋转操作符不参与部件匹配）、`O匕匕`
+  的 `𫧇`。
 
 O 模式自带的部件候选来自 `ids_data.bin`，因此即使当前方案没有拼音词典，也可以完成
 `O` + 拼音/双拼选部件。
@@ -351,7 +358,7 @@ I 模式和 O 模式都不再依赖 `recognizer/patterns/ids_reverse` 和 `match
 
 ```sh
 cd plugins/ids-reverse/data
-python3 generate_data_v2.py    # 依赖 pypinyin
+python3 generate_data_v4.py    # 依赖 pypinyin
 ```
 
 生成器会读取：
@@ -364,15 +371,15 @@ python3 generate_data_v2.py    # 依赖 pypinyin
 - `ids_variants.txt`（异体字表，`原始汉字\t异体字（空格分隔）`）
 - `wanxiang_charset.dict.yaml`（可选的本地字符集来源，不存在则跳过）
 
-产出 `ids_data.bin`（IDS4，约 29MB）。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
+产出 `ids_data.bin`（IDS4 v2，约 30MB）。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
 
-> IDS4 与旧 IDS3 数据文件不兼容。升级插件后必须重新生成 `ids_data.bin`；
+> IDS4 v2 与 IDS4 v1、旧 IDS3 数据文件不兼容。升级插件后必须重新生成 `ids_data.bin`；
 > 读取到旧 magic 时会直接加载失败。
 
 数据检查：
 
 ```sh
-python3 dump_ids4.py ids_data.bin
+python3 dump_ids_v4.py ids_data.bin
 ```
 
 ---
@@ -407,10 +414,13 @@ I 模式：
 - `I老六`
 - `I木木木`
 - `I氵工`
+- `I匕匕` → 结果包含 `𫧇`
 
 O 模式：
 
 - `O木木` → `林`
+- `O匕匕` → 结果包含 `𫧇`
+- `O了` → `𠄏` 优先展示（`⿿` 为旋转操作符，不作为部件）
 - `O沐木` → `淋`
 - `Omukou` → 组合候选 `木口`，选中后结果含 `呆`（如 `杏`、`呆`）
 - `Omumu` → 组合候选 `木木`，选中后得到 `林`

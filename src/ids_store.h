@@ -29,7 +29,7 @@ const rime::hash_map<std::string, int>& BlockAliasMap();
 constexpr uint16_t kNoToken = 0xFFFF;
 constexpr uint32_t kInvalidId = 0xFFFFFFFF;
 
-// IDS4 section type ids（必须与 generate_data_v2.py 一致）。
+// IDS4 section type ids（必须与 generate_data_v4.py 一致）。
 enum SectionType {
   kSecCp2Id = 1,
   kSecId2Cp = 2,
@@ -49,7 +49,34 @@ enum SectionType {
   kSecVar = 16,
   kSecTokCanon = 17,
   kSecAtomicSet = 18,
+  kSecLeafStruct = 19,
 };
+
+// 顶层部件多重集精确匹配的排序保底。普通 ALTS 伪精确匹配最高约 5700 万，
+// 普通混合叶序匹配最高约 6700 万，因此精确结构至少保底 7000 万。
+constexpr int64_t kExactStructureBonus = 20000000;
+constexpr int64_t kExactStructureFloor = 70000000;
+
+inline int64_t BoostExactStructureScore(int64_t score) {
+  score += kExactStructureBonus;
+  return score < kExactStructureFloor ? kExactStructureFloor : score;
+}
+
+inline uint32_t LeafStructHash(const uint16_t* tokens, size_t n) {
+  uint32_t h = 2166136261u;
+  auto mix = [&h](uint8_t v) {
+    h ^= v;
+    h *= 16777619u;
+  };
+  mix(static_cast<uint8_t>(n & 0xFF));
+  mix(static_cast<uint8_t>((n >> 8) & 0xFF));
+  for (size_t i = 0; i < n; ++i) {
+    uint16_t t = tokens[i];
+    mix(static_cast<uint8_t>(t & 0xFF));
+    mix(static_cast<uint8_t>((t >> 8) & 0xFF));
+  }
+  return h;
+}
 
 // 每字热记录（24 字节）：按 id 直索引。
 struct HotRec {
@@ -226,6 +253,18 @@ class IdsStore {
     *out = reinterpret_cast<const uint16_t*>(p + 2);
   }
 
+  // 顶层部件多重集索引：hash -> id 区间，调用方负责校验 LEAVES。
+  uint32_t leaf_struct_count() const { return leaf_struct_count_; }
+  uint32_t LeafStructHashAt(uint32_t i) const {
+    return i < leaf_struct_count_ ? Rd32(leaf_struct_ + 4 + i * 8) : 0;
+  }
+  uint32_t LeafStructIdAt(uint32_t i) const {
+    return i < leaf_struct_count_ ? Rd32(leaf_struct_ + 8 + i * 8) : kInvalidId;
+  }
+  // 查询顶层叶子多重集：内部完成 canonical 化、排序、hash 查找和 LEAVES 校验。
+  std::vector<uint32_t> LookupLeafStructure(
+      const std::vector<uint16_t>& tokens) const;
+
   // 供 translator 直接解码 COLD：返回 py/ids 长度与指针。
   void Cold(uint32_t id,
             const uint8_t** py,
@@ -394,6 +433,8 @@ class IdsStore {
   const uint8_t* var_ = nullptr;
   const uint32_t* key_lookup_ = nullptr;
   const uint16_t* tok_canon_ = nullptr;
+  const uint8_t* leaf_struct_ = nullptr;
+  uint32_t leaf_struct_count_ = 0;
 
   uint32_t num_chars_ = 0;
   uint32_t max_cp_ = 0;

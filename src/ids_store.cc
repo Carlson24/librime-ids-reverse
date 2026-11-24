@@ -146,6 +146,8 @@ IdsStore::~IdsStore() = default;
 bool IdsStore::Parse() {
   if (size_ < 32 || std::memcmp(base_, "IDS4", 4) != 0)
     return false;
+  if (Rd16(base_ + 4) != 2)
+    return false;  // 旧版 IDS4 缺少 LEAF_STRUCT，必须重新生成。
   max_cp_ = Rd32(base_ + 8);
   num_chars_ = Rd32(base_ + 12);
   uint32_t nkeys = Rd32(base_ + 16);
@@ -162,6 +164,8 @@ bool IdsStore::Parse() {
   uint64_t keyrec_len = 0;
   const uint8_t* atomset_sec = nullptr;
   uint64_t atomset_len = 0;
+  const uint8_t* leaf_struct_sec = nullptr;
+  uint64_t leaf_struct_len = 0;
 
   for (uint32_t i = 0; i < nsec; ++i) {
     const uint8_t* e = st + static_cast<size_t>(i) * 24;
@@ -230,13 +234,27 @@ bool IdsStore::Parse() {
         atomset_sec = p;
         atomset_len = len;
         break;
+      case kSecLeafStruct:
+        leaf_struct_sec = p;
+        leaf_struct_len = len;
+        break;
       default:
         break;
     }
   }
   if (!cp2id_ || !id2cp_ || !hot_ || !cold_idx_ || !alts_ || !leaves_ ||
       !atoms_ || !compset_ || !cold_ || !post_ || !key_lookup_ || !tokens_sec ||
-      !py_sec || !keyrec_sec)
+      !py_sec || !keyrec_sec || !leaf_struct_sec || !tok_canon_)
+    return false;
+
+  // LEAF_STRUCT: u32 count + count * {u32 hash, u32 id}
+  if (leaf_struct_len < 4)
+    return false;
+  leaf_struct_ = leaf_struct_sec;
+  leaf_struct_count_ = Rd32(leaf_struct_sec);
+  if (4 + static_cast<uint64_t>(leaf_struct_count_) * 8 > leaf_struct_len)
+    return false;
+  if (leaf_struct_count_ != num_chars_)
     return false;
 
   // TOKENS
@@ -335,6 +353,50 @@ bool IdsStore::Parse() {
   }
 
   return true;
+}
+
+std::vector<uint32_t> IdsStore::LookupLeafStructure(
+    const std::vector<uint16_t>& tokens) const {
+  std::vector<uint32_t> out;
+  if (tokens.empty() || !leaf_struct_ || leaf_struct_count_ == 0)
+    return out;
+
+  std::vector<uint16_t> want;
+  want.reserve(tokens.size());
+  for (uint16_t t : tokens)
+    want.push_back(CanonToken(t));
+  std::sort(want.begin(), want.end());
+
+  uint32_t hash = LeafStructHash(want.data(), want.size());
+  uint32_t lo = 0;
+  uint32_t hi = leaf_struct_count_;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    if (LeafStructHashAt(mid) < hash)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+
+  std::vector<uint16_t> got;
+  for (uint32_t i = lo; i < leaf_struct_count_; ++i) {
+    if (LeafStructHashAt(i) != hash)
+      break;
+    uint32_t id = LeafStructIdAt(i);
+    const uint16_t* leaves = nullptr;
+    uint16_t n = 0;
+    Leaves(id, &leaves, &n);
+    if (n != want.size())
+      continue;
+    got.clear();
+    got.reserve(n);
+    for (uint16_t j = 0; j < n; ++j)
+      got.push_back(CanonToken(leaves[j]));
+    std::sort(got.begin(), got.end());
+    if (got == want)
+      out.push_back(id);
+  }
+  return out;
 }
 
 bool IdsStore::SmallContains(const KeyEntry& e, uint32_t id) const {

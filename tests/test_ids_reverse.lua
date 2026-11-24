@@ -31,6 +31,14 @@ local function contains(text, ch)
   return text:find(ch, 1, true) ~= nil
 end
 
+local function index_of(ids, ch)
+  local cp = utf8.codepoint(ch)
+  for i, id in ipairs(ids) do
+    if store:cp_of_id(id) == cp then return i end
+  end
+  return nil
+end
+
 ok(store.num_chars > 100000, "字符数量")
 ok(store.num_tokens > 10000, "部件 token 数量")
 ok(store.num_keys > 10000, "倒排 key 数量")
@@ -76,9 +84,35 @@ ok(#search("老六") > 0, "I 老六")
 ok(#search("木木木") > 0, "I 木木木")
 ok(#search("氵工") > 0, "I 氵工")
 
+local bi_tokens = { store:find_token("匕"), store:find_token("匕") }
+local bi_exact = store:lookup_leaf_structure(bi_tokens)
+ok(contains(chars(bi_exact), "𫧇"), "结构索引 匕匕 包含 𫧇")
+ok(contains(chars(bi_exact), "比"), "结构索引 匕匕 包含 比")
+ok(not contains(chars(bi_exact), "昆"), "结构索引 匕匕 排除 昆")
+
+local le_exact = store:lookup_leaf_structure({ store:find_token("了") })
+ok(contains(chars(le_exact), "𠄏"), "结构索引 了 包含 𠄏")
+
+local i_bi = search("匕匕")
+ok(contains(chars(i_bi), "𫧇"), "I 匕匕 包含 𫧇")
+
+local i_le = search("了")
+ok(index_of(i_le, "𠄏") ~= nil,
+   "I 了 包含 𠄏")
+
+ok(I.format_ids("⿿了", "bracket") == "[旋转]了", "旋转操作符 bracket 格式")
+ok(I.format_ids("⿿了", "plain") == "了", "旋转操作符 plain 格式")
+
 local lin = hybrid({ "木木" })
 ok(utf8.char(store:cp_of_id(lin[1])) == "林", "O 木木 首选 林")
 ok(contains(chars(lin), "啉"), "O 木木 包含 啉")
+
+local o_le = hybrid({ "了" })
+local o_le_pos = index_of(o_le, "𠄏")
+ok(o_le_pos ~= nil and o_le_pos <= 3, "O 了 优先展示 𠄏")
+
+local o_bi = hybrid({ "匕匕" })
+ok(contains(chars(o_bi), "𫧇"), "O 匕匕 包含 𫧇")
 
 local sen_minus = hybrid({ "森", "-木" })
 ok(utf8.char(store:cp_of_id(sen_minus[1])) == "林", "O 森-木 首选 林")

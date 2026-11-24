@@ -664,7 +664,9 @@ int64_t ScoreHybridStrings(
 std::vector<uint32_t> RankHybridStrings(
     IdsStore& store,
     std::vector<uint32_t> cands,
-    const std::vector<std::string>& normalized) {
+    const std::vector<std::string>& normalized,
+    const hash_set<uint32_t>* exact_ids,
+    size_t score_limit) {
   std::map<std::string, int> user_atomics;
   std::vector<std::string> user_atomic_seq;
   hash_map<std::string, std::vector<std::string>> cache;
@@ -679,7 +681,7 @@ std::vector<uint32_t> RankHybridStrings(
     }
   }
 
-  size_t limit = std::min<size_t>(cands.size(), 500);
+  size_t limit = std::min<size_t>(cands.size(), score_limit);
   struct Scored {
     uint32_t id;
     int64_t score;
@@ -688,10 +690,11 @@ std::vector<uint32_t> RankHybridStrings(
   std::vector<Scored> scored;
   scored.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
-    scored.push_back({cands[i],
-                      ScoreHybridStrings(store, cands[i], norm_input,
-                                         user_atomics, user_atomic_seq, &cache),
-                      i});
+    int64_t sc = ScoreHybridStrings(store, cands[i], norm_input, user_atomics,
+                                    user_atomic_seq, &cache);
+    if (exact_ids && exact_ids->count(cands[i]))
+      sc = BoostExactStructureScore(sc);
+    scored.push_back({cands[i], sc, i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
     if (a.score != b.score)
@@ -709,15 +712,18 @@ std::vector<uint32_t> RankHybridStrings(
 
 std::vector<uint32_t> RankHybrid(IdsStore& store,
                                  std::vector<uint32_t> cands,
-                                 const std::vector<std::string>& normalized) {
+                                 const std::vector<std::string>& normalized,
+                                 const hash_set<uint32_t>* exact_ids,
+                                 size_t score_limit) {
   if (cands.size() <= 1 || normalized.empty())
     return cands;
 
   QueryAtoms q;
   if (!BuildQueryAtoms(store, normalized, &q))
-    return RankHybridStrings(store, std::move(cands), normalized);
+    return RankHybridStrings(store, std::move(cands), normalized, exact_ids,
+                             score_limit);
 
-  size_t limit = std::min<size_t>(cands.size(), 500);
+  size_t limit = std::min<size_t>(cands.size(), score_limit);
   struct Scored {
     uint32_t id;
     int64_t score;
@@ -726,7 +732,10 @@ std::vector<uint32_t> RankHybrid(IdsStore& store,
   std::vector<Scored> scored;
   scored.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
-    scored.push_back({cands[i], ScoreHybridTokens(store, cands[i], q), i});
+    int64_t sc = ScoreHybridTokens(store, cands[i], q);
+    if (exact_ids && exact_ids->count(cands[i]))
+      sc = BoostExactStructureScore(sc);
+    scored.push_back({cands[i], sc, i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
     if (a.score != b.score)
@@ -1079,7 +1088,51 @@ std::vector<uint32_t> SearchByLeaves(IdsStore& store,
                 cands.end());
   }
   RemoveExcluded(store, exclude_entries, &cands);
-  cands = RankHybrid(store, std::move(cands), normalized);
+
+  // 顶层叶子多重集精确匹配：不依赖字频 head，也不受普通候选打分上限影响。
+  std::vector<uint16_t> struct_tokens;
+  bool struct_ok = true;
+  for (const auto& n : normalized) {
+    uint16_t t = store.ResolveTerm(n);
+    if (t == kNoToken) {
+      struct_ok = false;
+      break;
+    }
+    struct_tokens.push_back(t);
+  }
+  std::vector<uint32_t> exact;
+  if (struct_ok)
+    exact = store.LookupLeafStructure(struct_tokens);
+  if (disabled_blocks) {
+    exact.erase(std::remove_if(exact.begin(), exact.end(),
+                               [&](uint32_t id) {
+                                 return disabled_blocks->count(static_cast<int>(
+                                            store.Hot(id).block)) > 0;
+                               }),
+                exact.end());
+  }
+  RemoveExcluded(store, exclude_entries, &exact);
+
+  hash_set<uint32_t> exact_set;
+  exact_set.reserve(exact.size());
+  std::vector<uint32_t> merged;
+  merged.reserve(exact.size() + cands.size());
+  for (uint32_t id : exact) {
+    if (exact_set.insert(id).second)
+      merged.push_back(id);
+  }
+  hash_set<uint32_t> seen = exact_set;
+  for (uint32_t id : cands) {
+    if (seen.insert(id).second)
+      merged.push_back(id);
+  }
+  cands.swap(merged);
+
+  size_t score_limit = 500;
+  if (!exact_set.empty())
+    score_limit = std::min<size_t>(cands.size(), 500 + exact_set.size());
+  cands = RankHybrid(store, std::move(cands), normalized,
+                     exact_set.empty() ? nullptr : &exact_set, score_limit);
   if (cands.size() > max_results)
     cands.resize(max_results);
   return cands;
