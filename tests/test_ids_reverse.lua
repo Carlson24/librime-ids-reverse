@@ -199,6 +199,35 @@ ok(o_le_pos ~= nil and o_le_pos <= 3, "O 了 优先展示 𠄏")
 local o_bi = hybrid({ "匕匕" })
 ok(contains(chars(o_bi), "𫧇"), "O 匕匕 包含 𫧇")
 
+-- 原始字形优先：同结构下先显示原文精确匹配，字频仅作最后兜底。
+local o_miao = hybrid({ "纟", "目", "少" })
+local o_miao_sim = index_of(o_miao, "缈")
+local o_miao_trad = index_of(o_miao, "緲")
+ok(o_miao_sim ~= nil and utf8.char(store:cp_of_id(o_miao[1])) == "缈",
+   "O 纟目少 首选 缈")
+ok(o_miao_sim ~= nil and o_miao_trad ~= nil and o_miao_sim < o_miao_trad,
+   "O 纟目少 缈 在 緲 前")
+
+local o_xiang = hybrid({ "纟", "目" })
+ok(utf8.char(store:cp_of_id(o_xiang[1])) == "缃", "O 纟目 首选 缃")
+
+local o_sha = hybrid({ "纟", "少" })
+ok(utf8.char(store:cp_of_id(o_sha[1])) == "纱", "O 纟少 首选 纱")
+
+local o_long = hybrid({ "龙" })
+local o_long_pos = index_of(o_long, "拢")
+local o_long_trad = index_of(o_long, "龍")
+ok(o_long_pos ~= nil and
+   (o_long_trad == nil or o_long_pos < o_long_trad),
+   "O 龙 优先原始字形 拢")
+
+local o_yan = hybrid({ "讠" })
+local o_yan_pos = index_of(o_yan, "计")
+local o_yan_trad = index_of(o_yan, "訁")
+ok(o_yan_pos ~= nil and
+   (o_yan_trad == nil or o_yan_pos < o_yan_trad),
+   "O 讠 优先原始字形 计")
+
 local sen_minus = hybrid({ "森", "-木" })
 ok(utf8.char(store:cp_of_id(sen_minus[1])) == "林", "O 森-木 首选 林")
 

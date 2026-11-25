@@ -222,6 +222,13 @@ local CANON_MAP = {
   ["钩"] = "亅", ["鉤"] = "亅", ["亅"] = "亅",
 }
 
+-- 用于判断查询中是否出现归一化字形；只有这类查询才需要原始字形优先排序。
+local CANON_EQUIV = {}
+for k, v in pairs(CANON_MAP) do
+  CANON_EQUIV[k] = true
+  CANON_EQUIV[v] = true
+end
+
 local BLOCK_ALIAS_MAP = {
   ["基本"] = 0, ["基本区"] = 0, ["basic"] = 0, ["base"] = 0, ["cjk"] = 0,
   ["扩a"] = 1, ["exta"] = 1, ["ext-a"] = 1, ["a"] = 1,
@@ -483,6 +490,7 @@ function Store.load(path, custom_path)
   end
 
   self.hot_cache = {}
+  self.literal_token_cache = {}
   self.cold_cache = {}
   self.compset_cache = {}
   self.leaves_cache = {}
@@ -2550,6 +2558,53 @@ local function atomic_decomposition(store, comp, cache, depth)
   return out
 end
 
+-- 原始字形分解节点：从 LEAVES 的原始 token 出发递归展开，保留每一层的
+-- 原始字形，用于“原文精确匹配优先”的同分排序。缓存按 token + 深度保存。
+local function collect_literal_token_nodes(store, token, cache, depth, out)
+  local depth_cache = cache[depth]
+  if not depth_cache then
+    depth_cache = {}
+    cache[depth] = depth_cache
+  end
+  local hit = depth_cache[token]
+  if hit then
+    for _, x in ipairs(hit) do out[#out + 1] = x end
+    return
+  end
+  local nodes = { token }
+  if depth <= 2 and not store:is_atomic_token(store:canon_token(token)) then
+    local cp = store:token_cp_of(token)
+    local id = cp ~= 0 and store:id_of_cp(cp) or INVALID_ID
+    if id ~= INVALID_ID then
+      local leaves = store:leaves(id)
+      if #leaves > 1 then
+        for _, child in ipairs(leaves) do
+          if child ~= token then
+            collect_literal_token_nodes(store, child, cache, depth + 1, nodes)
+          end
+        end
+      end
+    end
+  end
+  depth_cache[token] = nodes
+  for _, x in ipairs(nodes) do out[#out + 1] = x end
+end
+
+local function literal_hits(store, id, q_counts, cache)
+  local nodes = {}
+  for _, token in ipairs(store:leaves(id)) do
+    collect_literal_token_nodes(store, token, cache, 0, nodes)
+  end
+  local counts = {}
+  for _, n in ipairs(nodes) do counts[n] = (counts[n] or 0) + 1 end
+  local hits = 0
+  for q, need in pairs(q_counts) do
+    local have = counts[q] or 0
+    hits = hits + math.min(need, have)
+  end
+  return hits
+end
+
 local function keys_for_term(store, term, count)
   local keys = {}
   local function add_token(t)
@@ -2840,14 +2895,28 @@ local function score_hybrid_strings(store, id, normalized, user_atomics,
   return score
 end
 
-local function rank_hybrid_strings(store, cands, normalized, exact_ids,
+local function build_literal_query(store, raw, normalized)
+  local counts, needed = {}, false
+  for _, r in ipairs(raw or normalized) do
+    for _, ch in ipairs(utf8_chars(r)) do
+      if not is_ascii_alpha_only(ch) then
+        local t = store:find_token(ch)
+        if t ~= nil then counts[t] = (counts[t] or 0) + 1 end
+        if CANON_EQUIV[ch] then needed = true end
+      end
+    end
+  end
+  return counts, needed
+end
+
+local function rank_hybrid_strings(store, cands, normalized, raw, exact_ids,
                                    score_limit)
   local user_atomics = {}
   local user_atomic_seq = {}
   local cache = {}
   local norm_input = {}
-  for _, raw in ipairs(normalized) do
-    local c = canon(raw)
+  for _, item in ipairs(normalized) do
+    local c = canon(item)
     norm_input[#norm_input + 1] = c
     local atomics = atomic_decomposition(store, c, cache, 0)
     for _, a in ipairs(atomics) do
@@ -2857,6 +2926,8 @@ local function rank_hybrid_strings(store, cands, normalized, exact_ids,
   end
 
   local limit = math.min(#cands, score_limit or 500)
+  local q_counts, needs_literal = build_literal_query(store, raw, normalized)
+  local lit_cache = store.literal_token_cache
   local scored = {}
   for i = 1, limit do
     local sc = score_hybrid_strings(store, cands[i], norm_input, user_atomics,
@@ -2864,10 +2935,15 @@ local function rank_hybrid_strings(store, cands, normalized, exact_ids,
     if exact_ids and exact_ids[cands[i]] then
       sc = boost_exact_structure(sc)
     end
-    scored[#scored + 1] = { id = cands[i], score = sc, index = i }
+    local lh = needs_literal
+                 and literal_hits(store, cands[i], q_counts, lit_cache) or 0
+    scored[#scored + 1] = { id = cands[i], score = sc, literal = lh,
+                            freq = store:hot(cands[i]).freq, index = i }
   end
   table.sort(scored, function(a, b)
+    if a.literal ~= b.literal then return a.literal > b.literal end
     if a.score ~= b.score then return a.score > b.score end
+    if a.freq ~= b.freq then return a.freq > b.freq end
     return a.index < b.index
   end)
   local out = {}
@@ -2876,23 +2952,32 @@ local function rank_hybrid_strings(store, cands, normalized, exact_ids,
   return out
 end
 
-local function rank_hybrid(store, cands, normalized, exact_ids, score_limit)
+local function rank_hybrid(store, cands, normalized, raw, exact_ids,
+                           score_limit)
   if #cands <= 1 or #normalized == 0 then return cands end
   local q = build_query_atoms(store, normalized)
   if not q then
-    return rank_hybrid_strings(store, cands, normalized, exact_ids, score_limit)
+    return rank_hybrid_strings(store, cands, normalized, raw, exact_ids,
+                               score_limit)
   end
   local limit = math.min(#cands, score_limit or 500)
+  local q_counts, needs_literal = build_literal_query(store, raw, normalized)
+  local lit_cache = store.literal_token_cache
   local scored = {}
   for i = 1, limit do
     local sc = score_hybrid_tokens(store, cands[i], q)
     if exact_ids and exact_ids[cands[i]] then
       sc = boost_exact_structure(sc)
     end
-    scored[#scored + 1] = { id = cands[i], score = sc, index = i }
+    local lh = needs_literal
+                 and literal_hits(store, cands[i], q_counts, lit_cache) or 0
+    scored[#scored + 1] = { id = cands[i], score = sc, literal = lh,
+                            freq = store:hot(cands[i]).freq, index = i }
   end
   table.sort(scored, function(a, b)
+    if a.literal ~= b.literal then return a.literal > b.literal end
     if a.score ~= b.score then return a.score > b.score end
+    if a.freq ~= b.freq then return a.freq > b.freq end
     return a.index < b.index
   end)
   local out = {}
@@ -3454,7 +3539,7 @@ local function search_by_leaves(store, leaves, codec, max_results,
   if exact_count > 0 then
     score_limit = math.min(#cands, 500 + exact_count)
   end
-  cands = rank_hybrid(store, cands, normalized,
+  cands = rank_hybrid(store, cands, normalized, leaves,
                       exact_count > 0 and exact_set or nil, score_limit)
   if #cands > max_results then
     local r = {}

@@ -169,6 +169,105 @@ std::vector<std::string> AtomicDecomposition(
   return out;
 }
 
+// 查询部件是否参与字形归一（CanonMap 的键或值）。只有这类查询才需要原始
+// 字形优先排序；普通部件查询保持原有结构分排序。
+const hash_set<std::string>& CanonEquivSet() {
+  static const hash_set<std::string> kSet = [] {
+    hash_set<std::string> set;
+    for (const auto& kv : CanonMap()) {
+      set.insert(kv.first);
+      set.insert(kv.second);
+    }
+    return set;
+  }();
+  return kSet;
+}
+
+using LiteralNodeCache = hash_map<uint32_t, std::vector<uint16_t>>;
+
+// 原始字形分解节点：从 LEAVES 的原始 token 出发递归展开，保留每一层的
+// 原始字形。缓存键为 token + 深度，数据只读，可跨查询复用。
+const std::vector<uint16_t>& CollectLiteralTokenNodes(IdsStore& store,
+                                                      uint16_t token,
+                                                      LiteralNodeCache* cache,
+                                                      int depth) {
+  uint32_t key =
+      static_cast<uint32_t>(token) | (static_cast<uint32_t>(depth) << 16);
+  auto hit = cache->find(key);
+  if (hit != cache->end())
+    return hit->second;
+
+  std::vector<uint16_t> nodes;
+  nodes.push_back(token);
+  if (depth <= 2 && !store.IsAtomicToken(store.CanonToken(token))) {
+    uint32_t cp = store.TokenCp(token);
+    uint32_t id = cp ? store.IdOfCp(cp) : kInvalidId;
+    if (id != kInvalidId) {
+      const uint16_t* leaves = nullptr;
+      uint16_t n = 0;
+      store.Leaves(id, &leaves, &n);
+      if (n > 1) {
+        for (uint16_t i = 0; i < n; ++i) {
+          uint16_t child = leaves[i];
+          if (child == token)
+            continue;
+          const std::vector<uint16_t>& sub =
+              CollectLiteralTokenNodes(store, child, cache, depth + 1);
+          nodes.insert(nodes.end(), sub.begin(), sub.end());
+        }
+      }
+    }
+  }
+  auto inserted = cache->emplace(key, std::move(nodes));
+  return inserted.first->second;
+}
+
+struct LiteralQuery {
+  std::map<uint16_t, int> counts;
+  bool needed = false;
+};
+
+void BuildLiteralQuery(IdsStore& store,
+                       const std::vector<std::string>& raw,
+                       LiteralQuery* q) {
+  for (const auto& item : raw) {
+    for (const auto& ch : Utf8Chars(item)) {
+      if (ch.empty())
+        continue;
+      if (ch.size() == 1 && static_cast<unsigned char>(ch[0]) < 0x80)
+        continue;
+      uint16_t t;
+      if (store.FindToken(ch, &t))
+        q->counts[t] += 1;
+      if (CanonEquivSet().count(ch))
+        q->needed = true;
+    }
+  }
+}
+
+int LiteralHits(IdsStore& store,
+                uint32_t id,
+                const LiteralQuery& q,
+                LiteralNodeCache* cache) {
+  const uint16_t* leaves = nullptr;
+  uint16_t n = 0;
+  store.Leaves(id, &leaves, &n);
+  std::map<uint16_t, int> counts;
+  for (uint16_t i = 0; i < n; ++i) {
+    const std::vector<uint16_t>& nodes =
+        CollectLiteralTokenNodes(store, leaves[i], cache, 0);
+    for (uint16_t t : nodes)
+      ++counts[t];
+  }
+  int hits = 0;
+  for (const auto& kv : q.counts) {
+    auto it = counts.find(kv.first);
+    if (it != counts.end())
+      hits += std::min(kv.second, it->second);
+  }
+  return hits;
+}
+
 // ---------------------------------------------------------------------------
 // postings 读取 / 求交
 // ---------------------------------------------------------------------------
@@ -551,14 +650,15 @@ std::vector<uint32_t> RankHybridStrings(
     IdsStore& store,
     std::vector<uint32_t> cands,
     const std::vector<std::string>& normalized,
+    const std::vector<std::string>& raw,
     const hash_set<uint32_t>* exact_ids,
     size_t score_limit) {
   std::map<std::string, int> user_atomics;
   std::vector<std::string> user_atomic_seq;
   hash_map<std::string, std::vector<std::string>> cache;
   std::vector<std::string> norm_input;
-  for (const auto& raw : normalized) {
-    std::string c = Canon(raw);
+  for (const auto& item : normalized) {
+    std::string c = Canon(item);
     norm_input.push_back(c);
     std::vector<std::string> atomics = AtomicDecomposition(store, c, &cache, 0);
     for (const auto& a : atomics) {
@@ -567,10 +667,16 @@ std::vector<uint32_t> RankHybridStrings(
     }
   }
 
+  LiteralQuery literal;
+  BuildLiteralQuery(store, raw, &literal);
+  LiteralNodeCache literal_cache;
+
   size_t limit = std::min<size_t>(cands.size(), score_limit);
   struct Scored {
     uint32_t id;
     int64_t score;
+    int literal;
+    uint32_t freq;
     size_t index;
   };
   std::vector<Scored> scored;
@@ -580,11 +686,18 @@ std::vector<uint32_t> RankHybridStrings(
                                     user_atomic_seq, &cache);
     if (exact_ids && exact_ids->count(cands[i]))
       sc = BoostExactStructureScore(sc);
-    scored.push_back({cands[i], sc, i});
+    int literal_hits =
+        literal.needed ? LiteralHits(store, cands[i], literal, &literal_cache)
+                       : 0;
+    scored.push_back({cands[i], sc, literal_hits, store.Hot(cands[i]).freq, i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
+    if (a.literal != b.literal)
+      return a.literal > b.literal;
     if (a.score != b.score)
       return a.score > b.score;
+    if (a.freq != b.freq)
+      return a.freq > b.freq;
     return a.index < b.index;
   });
   std::vector<uint32_t> out;
@@ -599,6 +712,7 @@ std::vector<uint32_t> RankHybridStrings(
 std::vector<uint32_t> RankHybrid(IdsStore& store,
                                  std::vector<uint32_t> cands,
                                  const std::vector<std::string>& normalized,
+                                 const std::vector<std::string>& raw,
                                  const hash_set<uint32_t>* exact_ids,
                                  size_t score_limit) {
   if (cands.size() <= 1 || normalized.empty())
@@ -606,13 +720,19 @@ std::vector<uint32_t> RankHybrid(IdsStore& store,
 
   QueryAtoms q;
   if (!BuildQueryAtoms(store, normalized, &q))
-    return RankHybridStrings(store, std::move(cands), normalized, exact_ids,
-                             score_limit);
+    return RankHybridStrings(store, std::move(cands), normalized, raw,
+                             exact_ids, score_limit);
+
+  LiteralQuery literal;
+  BuildLiteralQuery(store, raw, &literal);
+  LiteralNodeCache literal_cache;
 
   size_t limit = std::min<size_t>(cands.size(), score_limit);
   struct Scored {
     uint32_t id;
     int64_t score;
+    int literal;
+    uint32_t freq;
     size_t index;
   };
   std::vector<Scored> scored;
@@ -621,11 +741,18 @@ std::vector<uint32_t> RankHybrid(IdsStore& store,
     int64_t sc = ScoreHybridTokens(store, cands[i], q);
     if (exact_ids && exact_ids->count(cands[i]))
       sc = BoostExactStructureScore(sc);
-    scored.push_back({cands[i], sc, i});
+    int literal_hits =
+        literal.needed ? LiteralHits(store, cands[i], literal, &literal_cache)
+                       : 0;
+    scored.push_back({cands[i], sc, literal_hits, store.Hot(cands[i]).freq, i});
   }
   std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
+    if (a.literal != b.literal)
+      return a.literal > b.literal;
     if (a.score != b.score)
       return a.score > b.score;
+    if (a.freq != b.freq)
+      return a.freq > b.freq;
     return a.index < b.index;
   });
   std::vector<uint32_t> out;
@@ -1017,7 +1144,7 @@ std::vector<uint32_t> SearchByLeaves(IdsStore& store,
   size_t score_limit = 500;
   if (!exact_set.empty())
     score_limit = std::min<size_t>(cands.size(), 500 + exact_set.size());
-  cands = RankHybrid(store, std::move(cands), normalized,
+  cands = RankHybrid(store, std::move(cands), normalized, leaves,
                      exact_set.empty() ? nullptr : &exact_set, score_limit);
   if (cands.size() > max_results)
     cands.resize(max_results);

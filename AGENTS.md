@@ -227,7 +227,10 @@ as a multi-character combo are stored as one layer; Backspace removes
   to the exclusion list. Exact top-level leaf multiset hits from
   `LEAF_STRUCT` are merged first and scored with the same exact-structure floor
   as I mode. Group parentheses are resolved before state entry, so `SearchHybrid`
-  normally receives only paren-free component strings.
+  normally receives only paren-free component strings. Hybrid ranking keys are
+  literal original-glyph hits, structural score, frequency, then candidate
+  index. Literal hits are computed from raw `LEAVES` tokens recursively and are
+  only evaluated when the query contains a `CanonMap` glyph (key or value).
 - **Group evaluator**: `EvaluateAlgebraExpression` (C++) /
   `evaluate_algebra_expression` (Lua) computes `+`/`-`/`!` and nested
   parentheses over components only, without dictionary lookup. It is used when
