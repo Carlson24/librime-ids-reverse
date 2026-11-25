@@ -2232,7 +2232,8 @@ rime::an<rime::Translation> IdsReverseTranslator::QueryHybrid(
              !st.components.empty()) {
     std::vector<uint32_t> results = SearchHybrid(
         store, st.components, PinyinMode(), config_.max_results,
-        config_.disabled_blocks_enabled ? &config_.disabled_blocks : nullptr);
+        config_.disabled_blocks_enabled ? &config_.disabled_blocks : nullptr,
+        IsRpnNotation(config_));
     BuildResultCandidates(store, results, segment, pending, translation.get());
   } else if (!pending.empty() && pending != "-" && pending != "+" &&
              pending != "!" && has_component) {
