@@ -26,6 +26,7 @@ Chinese; preserve that.
 | `src/ids_reverse_search.{h,cc}` | O-mode `SearchHybrid` (RPN add/subtract/exclude algebra) and component candidates. |
 | `ids_reverse.lua` | Whole Lua implementation; exports `processor`/`segmentor`/`translator`/`filter` and `_internal` for tests. |
 | `data/` | Generator, raw input tables, ignored outputs. |
+| `.github/workflows/build-ids-data.yml` | Manual data generation, verification, artifact upload, and Release publishing. |
 | `examples/` | Standalone schema and patch templates. |
 | `tests/` | Pure-Lua functional tests and latency benchmark. |
 | `README.md` | User documentation (Chinese). |

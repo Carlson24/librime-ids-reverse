@@ -456,6 +456,28 @@ python3 generate_data_v4.py    # 依赖 pypinyin
 python3 dump_ids_v4.py ids_data.bin
 ```
 
+### GitHub Actions 自动生成并发布
+
+仓库提供一个手动触发的 workflow：
+
+```text
+.github/workflows/build-ids-data.yml
+```
+
+在 GitHub 的 **Actions → Build and publish IDS data → Run workflow** 中运行。默认会：
+
+- 使用 Python 3.14 + `pypinyin==0.55.0` 生成 `ids_data.bin`；
+- 校验 IDS4 v3 结构并运行 Lua 功能测试；
+- 上传 `ids_data.bin` / `ids_data.bin.sha256` 作为 workflow artifact；
+- 创建或更新 `ids-data-latest` Release 并覆盖其中的资产。
+
+也可以在 `release_tag` 中输入日期版本（例如 `ids-data-2026.11.27`）以保留历史数据。
+固定下载地址格式：
+
+```text
+https://github.com/Carlson24/librime-ids-reverse/releases/download/ids-data-latest/ids_data.bin
+```
+
 ---
 
 ## 构建

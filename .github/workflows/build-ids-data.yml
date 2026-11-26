@@ -1,0 +1,146 @@
+name: Build and publish IDS data
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布 tag；留空或保持默认则更新 ids-data-latest"
+        required: false
+        default: "ids-data-latest"
+        type: string
+      make_latest:
+        description: "是否将此 Release 标记为 GitHub 最新 Release"
+        required: false
+        default: false
+        type: boolean
+
+run-name: Build IDS data (${{ inputs.release_tag || 'ids-data-latest' }})
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ids-data-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install data generator dependencies
+        run: |
+          python -m pip install --no-cache-dir pypinyin==0.55.0
+
+      - name: Generate IDS data
+        working-directory: data
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          python3 generate_data_v4.py
+
+      - name: Verify IDS data
+        working-directory: data
+        run: |
+          set -euo pipefail
+
+          test -s ids_data.bin
+
+          python3 dump_ids_v4.py ids_data.bin | tee /tmp/ids_dump.log
+
+          grep -q "Magic: IDS4 (Version 3)" /tmp/ids_dump.log
+          grep -q "LEAF_STRUCT:" /tmp/ids_dump.log
+          grep -q "PY_CHAR:" /tmp/ids_dump.log
+          if grep -q "Error:" /tmp/ids_dump.log; then
+            echo "ids_data.bin verification failed" >&2
+            exit 1
+          fi
+
+          size=$(stat -c%s ids_data.bin)
+          if [ "$size" -lt 20000000 ]; then
+            echo "ids_data.bin is unexpectedly small: $size bytes" >&2
+            exit 1
+          fi
+          echo "ids_data.bin size: $size bytes"
+
+      - name: Create checksum
+        working-directory: data
+        run: |
+          sha256sum ids_data.bin > ids_data.bin.sha256
+          cat ids_data.bin.sha256
+
+      - name: Install Lua and run functional tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+          lua5.4 tests/test_ids_reverse.lua data/ids_data.bin
+
+      - name: Prepare release metadata
+        id: meta
+        working-directory: data
+        run: |
+          set -euo pipefail
+
+          tag="${{ inputs.release_tag }}"
+          if [ -z "$tag" ]; then
+            tag="ids-data-latest"
+          fi
+
+          size=$(stat -c%s ids_data.bin)
+          sha=$(sha256sum ids_data.bin | cut -d' ' -f1)
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+
+          size="${{ steps.meta.outputs.size }}"
+          size_mb=$(awk -v n="$size" 'BEGIN { printf "%.2f", n / 1024 / 1024 }')
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          IDS4 数据由 GitHub Actions 自动生成。
+
+          - 提交：\`${{ github.sha }}\`
+          - 运行：[${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - Python：3.14
+          - pypinyin：0.55.0
+          - 文件大小：${size} 字节（约 ${size_mb} MB）
+          - SHA256：\`${{ steps.meta.outputs.sha }}\`
+
+          下载后可使用 \`ids_data.bin.sha256\` 校验文件完整性。
+          EOF
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ids_data-${{ github.run_number }}
+          path: |
+            data/ids_data.bin
+            data/ids_data.bin.sha256
+          if-no-files-found: error
+          # retention-days: 30
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: IDS data ${{ steps.meta.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          files: |
+            data/ids_data.bin
+            data/ids_data.bin.sha256
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: ${{ inputs.make_latest }}

@@ -1,4 +1,5 @@
 **/*.bin
+data/ids_data.bin.sha256
 data/ids_index.txt
 data/ids_meta.txt
 data/ids_data_dumped.txt
