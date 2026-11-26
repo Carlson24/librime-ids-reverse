@@ -4733,6 +4733,10 @@ local function on_select(ctx, env)
   st.components[#st.components + 1] = component
   st.codes[#st.codes + 1] = component
   save_hybrid_state(ctx, st.components, st.codes)
+  while not ctx.composition:empty()
+        and ctx.composition:back()._end > #base do
+    ctx.composition:pop_back()
+  end
   ctx.input = base .. component .. "'"
 end
 
@@ -5606,7 +5610,8 @@ local function filter_func(input, env)
     if scanned > 2000 then break end
     local genuine = cand:get_genuine()
     local ctype = genuine and genuine.type or cand.type
-    if ctype == "ids_reverse" or ctype == "hanzi_result" then
+    if ctype == "ids_reverse" or ctype == "hanzi_result"
+       or ctype == "hanzi_component" then
       yield(cand)
     elseif ctx.composition:empty() then
       yield(cand)

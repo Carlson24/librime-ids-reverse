@@ -277,6 +277,10 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
       st.components.push_back(text);
       st.codes.push_back(text);
       SaveHybridState(ctx, st.components, st.codes);
+      auto& comp = ctx->composition();
+      while (!comp.empty() && comp.back().end > base.size()) {
+        comp.pop_back();
+      }
       ctx->set_input(base + text + "'");
     }
   }
@@ -898,7 +902,8 @@ class HybridFilterTranslation : public rime::PrefetchTranslation {
       translation_->Next();
       an<Candidate> genuine = Candidate::GetGenuineCandidate(next);
       const std::string& type = genuine ? genuine->type() : next->type();
-      if (type == "ids_reverse" || type == "hanzi_result") {
+      if (type == "ids_reverse" || type == "hanzi_result" ||
+          type == "hanzi_component") {
         cache_.push_back(next);
         continue;
       }
