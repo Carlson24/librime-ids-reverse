@@ -4733,6 +4733,10 @@ local function on_select(ctx, env)
   st.components[#st.components + 1] = component
   st.codes[#st.codes + 1] = component
   save_hybrid_state(ctx, st.components, st.codes)
+  while not ctx.composition:empty()
+        and ctx.composition:back()._end > #base do
+    ctx.composition:pop_back()
+  end
   ctx.input = base .. component .. "'"
 end
 
