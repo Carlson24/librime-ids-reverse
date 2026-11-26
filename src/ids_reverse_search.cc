@@ -135,6 +135,82 @@ const hash_set<std::string>& AtomicComponents() {
   return kAtomic;
 }
 
+bool IsStrokeGlyph(const std::string& glyph) {
+  if (Utf8Chars(glyph).size() != 1)
+    return false;
+  size_t pos = 0;
+  uint32_t cp = DecodeNext(glyph, &pos);
+  if (cp == 0)
+    return false;
+  // 与 data/generate_data_v4.py 的 STROKE_CHARS 保持一致。
+  static const uint32_t kStrokes[] = {0x4E00, 0x4E28, 0x4E3F, 0x4E36,
+                                      0x4E59, 0x4E85, 0x2E80, 0x2010C};
+  for (uint32_t s : kStrokes) {
+    if (cp == s)
+      return true;
+  }
+  return cp >= 0x31C0 && cp <= 0x31EF;
+}
+
+const hash_set<std::string>& CanonicalAtomicComponents() {
+  static const hash_set<std::string> kSet = [] {
+    hash_set<std::string> set;
+    for (const auto& c : AtomicComponents())
+      set.insert(Canon(c));
+    return set;
+  }();
+  return kSet;
+}
+
+bool IsAtomicGlyph(const std::string& glyph, bool from_leaf) {
+  if (AtomicComponents().count(glyph))
+    return true;
+  // 与 SubtractCharacter 一致：用户给出的顶层字按原始字形判断，保留
+  // 龍 等传统复合字的可拆分性；递归进入叶子后再按归一化字形判断。
+  if (!from_leaf)
+    return false;
+  return CanonicalAtomicComponents().count(Canon(glyph)) != 0;
+}
+
+// 收集减法提示用的基本部件与中间复合部件。基本部件为递归停止处的字形，
+// 中间复合部件为实际继续展开过的字形；两者均保留原始字形。
+void CollectSubtractableParts(IdsStore& store,
+                              const std::string& glyph,
+                              std::vector<std::string>* basics,
+                              std::vector<std::string>* intermediates,
+                              hash_set<std::string>* visiting,
+                              int depth,
+                              bool is_root) {
+  std::string key = Canon(glyph);
+  if (depth > 5 || IsAtomicGlyph(glyph, !is_root) || visiting->count(key)) {
+    if (!is_root)
+      basics->push_back(glyph);
+    return;
+  }
+  std::vector<std::string> leaves =
+      TopLeavesOfComponent(store, glyph, /*preserve_glyph=*/true);
+  if (leaves.size() <= 1) {
+    if (!is_root)
+      basics->push_back(glyph);
+    return;
+  }
+  // 含笔画的字（如 少 = 小 + 丿）视为可减的基本部件，不再继续拆成笔画。
+  for (const auto& leaf : leaves) {
+    if (IsStrokeGlyph(leaf)) {
+      if (!is_root)
+        basics->push_back(glyph);
+      return;
+    }
+  }
+  visiting->insert(key);
+  if (!is_root)
+    intermediates->push_back(glyph);
+  for (const auto& leaf : leaves)
+    CollectSubtractableParts(store, leaf, basics, intermediates, visiting,
+                             depth + 1, /*is_root=*/false);
+  visiting->erase(key);
+}
+
 std::vector<std::string> AtomicDecomposition(
     IdsStore& store,
     const std::string& comp,
@@ -1348,20 +1424,91 @@ bool EvaluateRpnComponents(IdsStore& store,
   bool result_plus_after_sub = false;
   out->components.clear();
   for (const auto& value : stack) {
-    out->components.insert(out->components.end(), value.components.begin(),
-                           value.components.end());
     global_excludes.insert(global_excludes.end(), value.excludes.begin(),
                            value.excludes.end());
     result_has_sub = result_has_sub || value.has_sub;
     result_plus_after_sub = result_plus_after_sub || value.plus_after_sub;
   }
+
+  // 结尾是减法且栈内仍有多个操作数时，候选显示栈顶（刚算出的差值），
+  // 而不是把互不相容的栈值按“同时包含”求交导致候选为空。
+  const bool last_is_sub = !tokens.empty() && tokens.back() == "-";
+  if (last_is_sub && stack.size() > 1) {
+    const RpnValue& top = stack.back();
+    out->components = top.components;
+    *has_sub = top.has_sub;
+    *pure_sub = top.has_sub && !top.plus_after_sub;
+  } else {
+    for (const auto& value : stack) {
+      out->components.insert(out->components.end(), value.components.begin(),
+                             value.components.end());
+    }
+    *has_sub = result_has_sub;
+    *pure_sub = (stack.size() == 1 && result_has_sub && !result_plus_after_sub);
+  }
   out->excludes = std::move(global_excludes);
-  *has_sub = result_has_sub;
-  *pure_sub = (stack.size() == 1 && result_has_sub && !result_plus_after_sub);
   return true;
 }
 
 }  // namespace
+
+std::vector<std::string> GetSubtractableParts(
+    IdsStore& store,
+    const std::vector<std::string>& components) {
+  std::vector<std::string> parts;
+  if (components.empty())
+    return parts;
+
+  std::string target = components.back();
+  // 负号层/排除层不是可分解的操作数。
+  if (target.empty() || target[0] == '-' || target[0] == '!')
+    return parts;
+  if (target[0] == '+')
+    target.erase(target.begin());
+  if (Utf8Chars(target).size() != 1)
+    return parts;
+
+  std::vector<std::string> basics;
+  std::vector<std::string> intermediates;
+  hash_set<std::string> visiting;
+  CollectSubtractableParts(store, target, &basics, &intermediates, &visiting, 0,
+                           /*is_root=*/true);
+
+  hash_set<std::string> seen;
+  seen.insert(Canon(target));
+  auto add = [&](const std::vector<std::string>& list) {
+    if (parts.size() >= 8)
+      return;
+    for (const auto& part : list) {
+      if (parts.size() >= 8)
+        return;
+      if (part.empty() || IsStrokeGlyph(part))
+        continue;
+      std::string key = Canon(part);
+      if (!seen.insert(key).second)
+        continue;
+      if (!SubtractCharacter(store, target, part, 0))
+        continue;
+      // 若更早的正向操作数已经能减掉该部件，实际会作用到更早部件，跳过，
+      // 避免提示与实际扣减目标不一致。
+      bool captured = false;
+      for (size_t i = 0; i + 1 < components.size(); ++i) {
+        const std::string& comp = components[i];
+        if (comp.empty() || comp[0] == '-' || comp[0] == '+' || comp[0] == '!')
+          continue;
+        if (SubtractCharacter(store, comp, part, 0)) {
+          captured = true;
+          break;
+        }
+      }
+      if (!captured)
+        parts.push_back(part);
+    }
+  };
+  add(basics);
+  add(intermediates);
+  return parts;
+}
 
 std::vector<uint32_t> SearchHybrid(IdsStore& store,
                                    const std::vector<std::string>& components,

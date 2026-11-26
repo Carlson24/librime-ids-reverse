@@ -3461,6 +3461,118 @@ local function apply_single_subtraction(store, current, neg)
 end
 
 -- ---------------------------------------------------------------------------
+-- 减法待选：从最后一个已选部件中提取可减的下级部件
+-- ---------------------------------------------------------------------------
+
+local subtractable = {
+  STROKE_GLYPHS = {
+    ["一"] = true, ["丨"] = true, ["丿"] = true, ["丶"] = true,
+    ["乙"] = true, ["亅"] = true, ["⺀"] = true, ["𠄌"] = true,
+  },
+}
+
+function subtractable.is_stroke_glyph(glyph)
+  local chars = utf8_chars(glyph)
+  if #chars ~= 1 then return false end
+  local cp = decode_next(glyph, 0)
+  if cp == 0 then return false end
+  if subtractable.STROKE_GLYPHS[chars[1]] then return true end
+  return cp >= 0x31C0 and cp <= 0x31EF
+end
+
+function subtractable.is_atomic_glyph(glyph, from_leaf)
+  if ATOMIC_COMPONENTS[glyph] then return true end
+  -- 与 subtract_character 一致：顶层字按原始字形判断，递归叶子才用归一化字形。
+  if not from_leaf then return false end
+  local ch = canon(glyph)
+  if ATOMIC_COMPONENTS[ch] then return true end
+  if not subtractable.canonical_atomic then
+    subtractable.canonical_atomic = {}
+    for component in pairs(ATOMIC_COMPONENTS) do
+      subtractable.canonical_atomic[canon(component)] = true
+    end
+  end
+  return subtractable.canonical_atomic[ch] == true
+end
+
+function subtractable.collect(store, glyph, basics, intermediates, visiting,
+                              depth, is_root)
+  local key = canon(glyph)
+  if depth > 5 or subtractable.is_atomic_glyph(glyph, not is_root)
+      or visiting[key] then
+    if not is_root then basics[#basics + 1] = glyph end
+    return
+  end
+  local leaves = top_leaves_of_component(store, glyph, true)
+  if #leaves <= 1 then
+    if not is_root then basics[#basics + 1] = glyph end
+    return
+  end
+  -- 含笔画的字（如 少 = 小 + 丿）视为可减的基本部件，不再拆成笔画。
+  for _, leaf in ipairs(leaves) do
+    if subtractable.is_stroke_glyph(leaf) then
+      if not is_root then basics[#basics + 1] = glyph end
+      return
+    end
+  end
+  visiting[key] = true
+  if not is_root then intermediates[#intermediates + 1] = glyph end
+  for _, leaf in ipairs(leaves) do
+    subtractable.collect(store, leaf, basics, intermediates, visiting,
+                         depth + 1, false)
+  end
+  visiting[key] = nil
+end
+
+function subtractable.components(store, components)
+  local parts = {}
+  if not components or #components == 0 then return parts end
+
+  local target = components[#components]
+  if target == "" then return parts end
+  local first = target:sub(1, 1)
+  -- 负号层/排除层不是可分解的操作数。
+  if first == "-" or first == "!" then return parts end
+  if first == "+" then target = target:sub(2) end
+  if utf8_length(target) ~= 1 then return parts end
+
+  local basics, intermediates = {}, {}
+  local visiting = {}
+  subtractable.collect(store, target, basics, intermediates, visiting, 0, true)
+
+  local seen = { [canon(target)] = true }
+  local function add(list)
+    if #parts >= 8 then return end
+    for _, part in ipairs(list) do
+      if #parts >= 8 then return end
+      if part ~= "" and not subtractable.is_stroke_glyph(part) then
+        local key = canon(part)
+        if not seen[key] then
+          seen[key] = true
+          -- 必须在目标字上确实可减，且不会被更早的正向操作数先减掉。
+          if subtract_character(store, target, part, 0, false) then
+            local captured = false
+            for i = 1, #components - 1 do
+              local comp = components[i]
+              local lead = comp:sub(1, 1)
+              if lead ~= "-" and lead ~= "+" and lead ~= "!"
+                  and subtract_character(store, comp, part, 0, false) then
+                captured = true
+                break
+              end
+            end
+            if not captured then parts[#parts + 1] = part end
+          end
+        end
+      end
+    end
+  end
+  add(basics)
+  add(intermediates)
+  return parts
+end
+
+-- ---------------------------------------------------------------------------
 -- 括号表达式求值（只算部件，不查词典）
 -- ---------------------------------------------------------------------------
 
@@ -3687,21 +3799,35 @@ function M._rpn.evaluate(store, components, codec)
     end
   end
 
-  local result_components = {}
   local result_has_sub = false
   local result_plus_after_sub = false
+  local result_components = {}
   for _, value in ipairs(stack) do
-    for _, c in ipairs(value.components) do
-      result_components[#result_components + 1] = c
-    end
     for _, e in ipairs(value.excludes) do
       excludes[#excludes + 1] = e
     end
     result_has_sub = result_has_sub or value.has_sub
     result_plus_after_sub = result_plus_after_sub or value.plus_after_sub
   end
-  local pure_sub = #stack == 1 and result_has_sub
-                   and not result_plus_after_sub
+
+  -- 结尾是减法且栈内仍有多个操作数时，候选显示栈顶（刚算出的差值），
+  -- 而不是把互不相容的栈值按“同时包含”求交导致候选为空。
+  local pure_sub
+  local last_is_sub = #components > 0 and components[#components] == "-"
+  if last_is_sub and #stack > 1 then
+    local top = stack[#stack]
+    result_components = top.components
+    result_has_sub = top.has_sub
+    pure_sub = top.has_sub and not top.plus_after_sub
+  else
+    for _, value in ipairs(stack) do
+      for _, c in ipairs(value.components) do
+        result_components[#result_components + 1] = c
+      end
+    end
+    pure_sub = #stack == 1 and result_has_sub
+               and not result_plus_after_sub
+  end
   return result_components, excludes, pure_sub, result_has_sub
 end
 
@@ -4289,6 +4415,22 @@ local function save_hybrid_state(ctx, components, codes)
   ctx:set_property(HYBRID_STATE_PROPERTY, table.concat(out))
 end
 
+-- 退格后让最后一段重新参与翻译。删除状态层时 composition 会保留上一层的
+-- 引号段；该段可能仍是 kConfirmed，TranslateSegments 会跳过它，导致状态已
+-- 更新但候选不再生成。
+local function retag_last_segment(ctx, env)
+  while not ctx.composition:empty()
+        and ctx.composition:back().start == ctx.composition:back()._end do
+    ctx.composition:pop_back()
+  end
+  if not ctx.composition:empty() then
+    local sep = ctx.composition:back()
+    sep.tags = Set({ env.config.hybrid.tag, RESULT_SEGMENT_TAG })
+    sep.status = "kVoid"
+  end
+  ctx.input = ctx.input
+end
+
 local function has_variants(text)
   if not store_instance then return true end
   local pos = 0
@@ -4717,16 +4859,7 @@ local function processor_func(key_event, env)
       if pending_bytes == 0 then pending_bytes = 1 end
       if pending_chars == 1 and #st.components > 0 then
         ctx:pop_input(pending_bytes)
-        while not ctx.composition:empty()
-              and ctx.composition:back().start == ctx.composition:back()._end do
-          ctx.composition:pop_back()
-        end
-        if not ctx.composition:empty() then
-          local sep = ctx.composition:back()
-          sep.tags = Set({ env.config.hybrid.tag, RESULT_SEGMENT_TAG })
-          sep.status = "kVoid"
-        end
-        ctx.input = ctx.input
+        retag_last_segment(ctx, env)
         return 1
       end
       ctx:pop_input(pending_bytes)
@@ -4753,10 +4886,8 @@ local function processor_func(key_event, env)
       st.codes[#st.codes] = nil
       save_hybrid_state(ctx, st.components, st.codes)
       if not ctx.composition:empty() then ctx.composition:pop_back() end
-      if not ctx.composition:empty() then
-        ctx.composition:back().status = "kGuess"
-      end
       ctx:pop_input(code_len + 1)
+      retag_last_segment(ctx, env)
     else
       leave_o_mode(ctx)
       ctx:clear()
@@ -5090,6 +5221,21 @@ local function build_component_candidates(store, results, segment, config)
   end
 end
 
+function subtractable.build_candidates(store, parts, segment, config)
+  for _, text in ipairs(parts) do
+    local cp = decode_next(text, 0)
+    local id = cp ~= 0 and store:id_of_cp(cp) or INVALID_ID
+    if id == INVALID_ID
+        or not (config.disabled_blocks_enabled
+                and config.disabled_blocks[store:hot_block(id)]) then
+      local cand = Candidate("hanzi_component", segment.start, segment._end,
+                             text, "可减部件")
+      cand.quality = 100.0
+      yield(cand)
+    end
+  end
+end
+
 local function build_multi_component_candidates(store, tokens, segment, config,
                                                 ctx)
   local per_token_limit = 4
@@ -5356,6 +5502,13 @@ local function query_hybrid(segment, env)
   end
 
   if (pending == "" or is_operator_only) and #st.components > 0 then
+    -- 减法待选：先把前一个部件中可减的下级部件排在结果候选之前。
+    if pending == "-" and env.config.algebra_notation ~= "rpn" then
+      local parts = subtractable.components(store, st.components)
+      if #parts > 0 then
+        subtractable.build_candidates(store, parts, segment, env.config)
+      end
+    end
     local comp_list = {}
     for _, comp in ipairs(st.components) do comp_list[#comp_list + 1] = comp end
     if pending ~= "" then comp_list[#comp_list + 1] = pending end
@@ -5520,6 +5673,7 @@ M._internal = {
   format_group_component = format_group_component,
   is_component_expression = is_component_expression,
   build_multi_component_candidates = build_multi_component_candidates,
+  subtractable_components = subtractable.components,
   build_variant_candidates = build_variant_candidates,
   clear_query_caches = clear_query_caches,
   load_config = load_config,

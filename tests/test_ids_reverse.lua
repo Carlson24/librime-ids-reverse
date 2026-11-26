@@ -247,6 +247,20 @@ ok(utf8.char(store:cp_of_id(chun[1])) == "𡗗", "O 春-日 首选 𡗗")
 local pei = hybrid({ "佩", "-亻" })
 ok(utf8.char(store:cp_of_id(pei[1])) == "𫥞", "O 佩-亻 首选 𫥞")
 
+-- 减法待选：先列基本部件，再列中间复合部件。
+local function subtractable(components)
+  return table.concat(I.subtractable_components(store, components))
+end
+ok(subtractable({ "渺" }) == "氵目少眇", "O 渺- 提示 氵目少眇")
+ok(subtractable({ "眇" }) == "目少", "O 眇- 提示 目少")
+ok(subtractable({ "森" }) == "木林", "O 森- 提示 木林")
+ok(subtractable({ "春" }) == "人三日𡗗", "O 春- 提示 人三日𡗗")
+ok(subtractable({ "木" }) == "", "O 木- 无额外提示")
+ok(subtractable({ "少" }) == "", "O 少- 不拆成笔画")
+ok(subtractable({ "森", "-木" }) == "", "负操作数不提示可减部件")
+local miao_minus_water = hybrid({ "渺", "-氵" })
+ok(utf8.char(store:cp_of_id(miao_minus_water[1])) == "眇", "O 渺-氵 首选 眇")
+
 -- 括号分组：外层运算符作用于组内所有部件
 local miao_group = hybrid({ "渺", "-(水少)" })
 ok(utf8.char(store:cp_of_id(miao_group[1])) == "目", "O 渺-(水少) 首选 目")
@@ -272,6 +286,17 @@ local rpn_zhang = rpn({ "章", "日", "-", "十", "-" })
 ok(utf8.char(store:cp_of_id(rpn_zhang[1])) == "立", "RPN 章日-十- 首选 立")
 local rpn_da = rpn({ "达", "大", "-" })
 ok(utf8.char(store:cp_of_id(rpn_da[1])) == "辶", "RPN 达大- 首选 辶")
+-- 结尾减法且栈内仍有多个操作数时，显示栈顶的中间结果。
+local rpn_partial_sub = rpn({ "渺", "沙", "少", "-" })
+ok(#rpn_partial_sub > 0, "RPN 渺沙少- 不消失")
+ok(utf8.char(store:cp_of_id(rpn_partial_sub[1])) == "氵",
+   "RPN 渺沙少- 首选 氵")
+local rpn_full_sub = rpn({ "渺", "沙", "少", "-", "-" })
+ok(utf8.char(store:cp_of_id(rpn_full_sub[1])) == "眇",
+   "RPN 渺沙少-- 首选 眇")
+local rpn_two_operands = rpn({ "木", "木" })
+ok(utf8.char(store:cp_of_id(rpn_two_operands[1])) == "林",
+   "RPN 木木 仍按同时包含")
 local rpn_excluded = chars(rpn({ "木", "木", "口", "!" }))
 ok(not contains(rpn_excluded, "啉"), "RPN 木木口! 排除 啉")
 local rpn_grouped_excluded = chars(rpn({ "木", "木", "口", "日", "+", "!" }))
