@@ -224,6 +224,8 @@ local o_yan_trad = index_of(o_yan, "訁")
 ok(o_yan_pos ~= nil and
    (o_yan_trad == nil or o_yan_pos < o_yan_trad),
    "O 讠 优先原始字形 计")
+local he_ids = hybrid({ "人", "一", "口" })
+ok(utf8.char(store:cp_of_id(he_ids[1])) == "合", "O 人一口 首选 合")
 
 -- 逆波兰后缀表达式
 local sen_minus = hybrid({ "森", "木", "-" })

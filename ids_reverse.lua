@@ -3703,6 +3703,15 @@ local function search_by_leaves(store, leaves, codec, max_results,
     cands = filtered
   end
   cands = remove_excluded(store, exclude_entries, cands)
+  if #order >= 2 and #cands > 500 then
+    local freqs = {}
+    for i = 1, #cands do freqs[cands[i]] = store:hot_freq(cands[i]) end
+    table.sort(cands, function(a, b)
+      local fa, fb = freqs[a], freqs[b]
+      if fa ~= fb then return fa > fb end
+      return a < b
+    end)
+  end
 
   local exact = lookup_exact_structure(store, normalized, disabled_blocks)
   exact = remove_excluded(store, exclude_entries, exact)

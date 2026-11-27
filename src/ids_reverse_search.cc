@@ -1035,6 +1035,20 @@ std::vector<uint32_t> SearchByLeaves(IdsStore& store,
                 cands.end());
   }
   RemoveExcluded(store, exclude_entries, &cands);
+  if (order.size() >= 2 && cands.size() > 500) {
+    // IntersectPostings 按 id（Unicode 码位）升序返回，扩A（0x3400..0x4DBF）
+    // 会排在基本区（0x4E00..0x9FFF）之前；先按字频截取前 500，避免高频基本字
+    // 被 score_limit = 500 截掉。
+    std::partial_sort(cands.begin(), cands.begin() + 500, cands.end(),
+                      [&](uint32_t a, uint32_t b) {
+                        uint32_t fa = store.Hot(a).freq;
+                        uint32_t fb = store.Hot(b).freq;
+                        if (fa != fb)
+                          return fa > fb;
+                        return a < b;
+                      });
+    cands.resize(500);
+  }
 
   // 顶层叶子多重集精确匹配：不依赖字频 head，也不受普通候选打分上限影响。
   std::vector<uint16_t> struct_tokens;
