@@ -1332,7 +1332,7 @@ std::vector<uint32_t> GetPinyinCandidates(IdsStore& store,
     return it->second;
   }
 
-  // 兼容旧数据（理论上 v3 不允许缺少 PY_CHAR）。
+  // 兼容旧数据（理论上 v4 不允许缺少 PY_CHAR）。
   auto it = store.py_map().find(pinyin);
   if (it == store.py_map().end())
     return {};
@@ -1402,7 +1402,7 @@ std::vector<uint32_t> GetComponentCandidates(IdsStore& store,
         add_id(id);
     }
   } else {
-    // 兼容旧数据（理论上 v3 不允许缺少 PY_CHAR）。
+    // 兼容旧数据（理论上 v4 不允许缺少 PY_CHAR）。
     for (const auto& lookup : lookups) {
       auto it = store.py_map().find(lookup);
       if (it == store.py_map().end())

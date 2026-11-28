@@ -18,10 +18,10 @@ local SEC_CP2ID = 1
 local SEC_ID2CP = 2
 local SEC_HOT = 3
 local SEC_COLD_IDX = 4
-local SEC_ALTS = 5
+local SEC_ALTS = 5      -- reserved (IDS4 v4)
 local SEC_LEAVES = 6
 local SEC_ATOMS = 7
-local SEC_COMPSET = 8
+local SEC_COMPSET = 8   -- reserved (IDS4 v4)
 local SEC_COLD = 9
 local SEC_TOKENS = 10
 local SEC_PY = 11
@@ -388,6 +388,13 @@ local function ctz64(lsb)
   return 56 + BYTE_CTZ[(hi >> 24) & 0xFF]
 end
 
+local function popcount32(x)
+  x = x - ((x >> 1) & 0x55555555)
+  x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+  x = (x + (x >> 4)) & 0x0F0F0F0F
+  return ((x * 0x01010101) & 0xFFFFFFFF) >> 24
+end
+
 local function array_format(cache, n, unit)
   local fmt = cache[n]
   if not fmt then
@@ -452,7 +459,7 @@ function Store.load(path, custom_path)
 
   local magic, version, flags, max_cp, num_chars, nkeys, nsec =
       string.unpack("<c4HHIIII", blob, 1)
-  if version ~= 3 then
+  if version ~= 4 then
     return nil, "old IDS4 data (version " .. tostring(version) ..
                 "), please regenerate ids_data.bin"
   end
@@ -472,9 +479,9 @@ function Store.load(path, custom_path)
   end
 
   local required = {
-    SEC_CP2ID, SEC_ID2CP, SEC_HOT, SEC_COLD_IDX, SEC_ALTS, SEC_LEAVES,
-    SEC_ATOMS, SEC_COMPSET, SEC_COLD, SEC_POST, SEC_KEY_LOOKUP, SEC_TOKENS,
-    SEC_PY, SEC_PY_CHAR, SEC_KEY_REC, SEC_LEAF_STRUCT,
+    SEC_CP2ID, SEC_ID2CP, SEC_HOT, SEC_COLD_IDX, SEC_LEAVES, SEC_ATOMS,
+    SEC_COLD, SEC_POST, SEC_KEY_LOOKUP, SEC_TOKENS, SEC_PY, SEC_PY_CHAR,
+    SEC_KEY_REC, SEC_LEAF_STRUCT,
   }
   for _, t in ipairs(required) do
     if not self.sections[t] then return nil, "missing section " .. t end
@@ -484,16 +491,19 @@ function Store.load(path, custom_path)
   self.id2cp_off = self.sections[SEC_ID2CP].off
   self.hot_off = self.sections[SEC_HOT].off
   self.cold_idx_off = self.sections[SEC_COLD_IDX].off
-  self.alts_off = self.sections[SEC_ALTS].off
   self.leaves_off = self.sections[SEC_LEAVES].off
   self.atoms_off = self.sections[SEC_ATOMS].off
-  self.compset_off = self.sections[SEC_COMPSET].off
   self.cold_off = self.sections[SEC_COLD].off
   self.post_off = self.sections[SEC_POST].off
   self.key_lookup_off = self.sections[SEC_KEY_LOOKUP].off
   self.key_rec_off = self.sections[SEC_KEY_REC].off
   if self.sections[SEC_VAR_OFF] then
-    self.var_off_off = self.sections[SEC_VAR_OFF].off
+    self.var_mask_off = self.sections[SEC_VAR_OFF].off
+    self.var_mask_words = (self.num_chars + 31) >> 5
+    if self.sections[SEC_VAR_OFF].len < self.var_mask_words * 4 then
+      return nil, "bad VAR_OFF section"
+    end
+    self.var_off_off = self.var_mask_off + self.var_mask_words * 4
   end
   if self.sections[SEC_VAR] then
     self.var_off_data = self.sections[SEC_VAR].off
@@ -513,7 +523,6 @@ function Store.load(path, custom_path)
   self.hot_cache = {}
   self.literal_token_cache = {}
   self.cold_cache = {}
-  self.compset_cache = {}
   self.leaves_cache = {}
   self.atoms_cache = {}
   self.variants_cache = {}
@@ -548,52 +557,42 @@ function Store:hot_freq(id)
   local hit = self.hot_cache[id]
   if hit then return hit.freq end
   if id >= self.num_chars then return 0 end
-  return rd32(self.blob, self.hot_off + id * 24)
+  return rd32(self.blob, self.hot_off + id * 16)
 end
 
 function Store:hot_block(id)
   local hit = self.hot_cache[id]
   if hit then return hit.block end
   if id >= self.num_chars then return 0 end
-  return self.blob:byte(self.hot_off + id * 24 + 12) or 0
-end
-
-function Store:hot_score_fields(id)
-  local hit = self.hot_cache[id]
-  if hit then
-    return hit.freq, hit.flags, hit.char_token, hit.depth, hit.alts_off
-  end
-  if id >= self.num_chars then return 0, 0, NO_TOKEN, 0, 0 end
-  return string.unpack("<I4I4I2I1xI4", self.blob, self.hot_off + id * 24 + 1)
+  return self.blob:byte(self.hot_off + id * 16 + 7) or 0
 end
 
 function Store:hot(id)
   if id >= self.num_chars then
-    return { freq = 0, flags = 0, char_token = NO_TOKEN, depth = 0,
-             block = 0, alts_off = 0, leaf_off = 0, atom_off = 0 }
+    return { freq = 0, char_token = NO_TOKEN, depth = 0,
+             block = 0, leaf_off = 0, atom_off = 0 }
   end
   local hit = self.hot_cache[id]
   if hit then return hit end
-  local freq, flags, char_token, depth, block, alts_off, leaf_off, atom_off =
-      string.unpack("<I4I4I2I1I1I4I4I4", self.blob, self.hot_off + id * 24 + 1)
-  local rec = { freq = freq, flags = flags, char_token = char_token,
-                depth = depth, block = block, alts_off = alts_off,
+  local freq, char_token, depth, block, leaf_off, atom_off =
+      string.unpack("<I4I2I1I1I4I4", self.blob, self.hot_off + id * 16 + 1)
+  local rec = { freq = freq, char_token = char_token,
+                depth = depth, block = block,
                 leaf_off = leaf_off, atom_off = atom_off }
   self.hot_cache[id] = rec
   return rec
 end
 
 function Store:cold_idx(id)
-  local off = self.cold_idx_off + id * 8
-  local cs_off, cold_off = string.unpack("<I4I4", self.blob, off + 1)
-  return cs_off, cold_off
+  local off = self.cold_idx_off + id * 4
+  return string.unpack("<I4", self.blob, off + 1)
 end
 
 function Store:cold(id)
   if id >= self.num_chars then return "", "" end
   local hit = self.cold_cache[id]
   if hit then return hit[1], hit[2] end
-  local _, cold_off = self:cold_idx(id)
+  local cold_off = self:cold_idx(id)
   local p = self.cold_off + cold_off
   local py_len = rd16(self.blob, p)
   local py = self.blob:sub(p + 3, p + 2 + py_len)
@@ -604,22 +603,12 @@ function Store:cold(id)
   return py, ids
 end
 
-function Store:comp_set(id)
-  if id >= self.num_chars then return {} end
-  local hit = self.compset_cache[id]
-  if hit then return hit end
-  local cs_off = self:cold_idx(id)
-  local out = read_token_array(self.blob, self.compset_off + cs_off)
-  self.compset_cache[id] = out
-  return out
-end
-
 function Store:leaves(id)
   if id >= self.num_chars then return {} end
   local hit = self.leaves_cache[id]
   if hit then return hit end
   local h = self.hot_cache[id]
-  local leaf_off = h and h.leaf_off or rd32(self.blob, self.hot_off + id * 24 + 16)
+  local leaf_off = h and h.leaf_off or rd32(self.blob, self.hot_off + id * 16 + 8)
   local out = read_token_array(self.blob, self.leaves_off + leaf_off)
   self.leaves_cache[id] = out
   return out
@@ -663,7 +652,7 @@ function Store:atomics(id)
   local hit = self.atoms_cache[id]
   if hit then return hit end
   local h = self.hot_cache[id]
-  local atom_off = h and h.atom_off or rd32(self.blob, self.hot_off + id * 24 + 20)
+  local atom_off = h and h.atom_off or rd32(self.blob, self.hot_off + id * 16 + 12)
   local out = read_token_array(self.blob, self.atoms_off + atom_off)
   self.atoms_cache[id] = out
   return out
@@ -952,10 +941,24 @@ function Store:for_each_full(entry, f)
 end
 
 function Store:variants(id)
-  if id >= self.num_chars or not self.var_off_off then return {} end
+  if id >= self.num_chars or not self.var_mask_off then return {} end
   local hit = self.variants_cache[id]
   if hit then return hit end
-  local off = rd32(self.blob, self.var_off_off + id * 4)
+  local word = id >> 5
+  local bit = id & 31
+  local w = rd32(self.blob, self.var_mask_off + word * 4)
+  if (w & (1 << bit)) == 0 then
+    self.variants_cache[id] = {}
+    return self.variants_cache[id]
+  end
+  local rank = 0
+  for i = 0, word - 1 do
+    rank = rank + popcount32(rd32(self.blob, self.var_mask_off + i * 4))
+  end
+  if bit > 0 then
+    rank = rank + popcount32(w & ((1 << bit) - 1))
+  end
+  local off = rd32(self.blob, self.var_off_off + rank * 4)
   local p = self.var_off_data + off
   local n = rd16(self.blob, p)
   local out = {}
@@ -2997,7 +3000,7 @@ local function get_pinyin_candidates(store, pinyin, limit)
     return ids
   end
 
-  -- 兼容旧数据（理论上 v3 不允许缺少 PY_CHAR）。
+  -- 兼容旧数据（理论上 v4 不允许缺少 PY_CHAR）。
   local list = store.py_map[pinyin]
   if not list then return {} end
   local ids, seen = {}, {}
@@ -3062,7 +3065,7 @@ local function get_component_candidates(store, raw_code, codec, limit)
       end
     end
   else
-    -- 兼容旧数据（理论上 v3 不允许缺少 PY_CHAR）。
+    -- 兼容旧数据（理论上 v4 不允许缺少 PY_CHAR）。
     for _, lookup in ipairs(lookups) do
       local list = store.py_map[lookup]
       if list then

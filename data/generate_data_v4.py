@@ -1107,13 +1107,6 @@ def main():
             return C2.get(inner, inner)
         return C2.get(s, s)
 
-    def fnv32(tokens):
-        h = 2166136261
-        for t in tokens:
-            h ^= (t & 0xFF); h = (h * 16777619) & 0xFFFFFFFF
-            h ^= (t >> 8) & 0xFF; h = (h * 16777619) & 0xFFFFFFFF
-        return h
-
     def leaf_struct_hash(tokens):
         """顶层叶子多重集 hash：长度 + 已排序 token，必须与 C++/Lua 一致。"""
         h = 2166136261
@@ -1301,13 +1294,11 @@ def main():
     NT = len(tokens)
     assert NT <= 65534, NT
 
-    # ---- per-char ALTS / LEAVES / ATOMS / COMPSET / COLD + CHAR ----
+    # ---- per-char LEAVES / ATOMS / COLD + CHAR ----
     CHAR = bytearray()
     COLD_IDX = bytearray()
-    ALTS = bytearray()
     LEAVES = bytearray()
     ATOMS = bytearray()
-    CS = bytearray()
     COLD = bytearray()
     for i, cp in enumerate(chars):
         rec = meta_by_cp.get(cp)
@@ -1315,43 +1306,12 @@ def main():
             freq_score, block_id, depth = rec[1], rec[2], rec[3]
             py_bytes = rec[4].encode('utf-8')
             ids_bytes = rec[5].encode('utf-8')
-            keys_str = rec[6]
         else:
             freq_score, block_id, depth = 0, 0, 0
-            py_bytes, ids_bytes, keys_str = b'', b'', ''
+            py_bytes, ids_bytes = b'', b''
 
-        variants = []
-        seen_v = set()
-        if keys_str:
-            for var in keys_str.split('|'):
-                tv = tuple(tok_id[C2of(c)] for c in var.split(',') if c and C2of(c) in tok_id)
-                if tv and tv not in seen_v:
-                    seen_v.add(tv)
-                    variants.append(tv)
-        groups = {}
-        for tv in variants:
-            groups.setdefault(len(tv), []).append(tv)
-        len_mask = 0
-        for L in groups:
-            if 1 <= L <= 31:
-                len_mask |= (1 << L)
-        comp_sorted = sorted({t for tv in variants for t in tv})
         ch_str = chr(cp)
         ctok = tok_id.get(ch_str, tok_id.get(C2of(ch_str), 65535))
-
-        alts_off = len(ALTS)
-        ab = bytearray()
-        glens = sorted(groups.keys())
-        ab.append(len(glens) & 0xFF)
-        for L in glens:
-            vs = groups[L]
-            ab.append(L & 0xFF)
-            ab += struct.pack('<H', len(vs))
-            for tv in vs:
-                for t in tv:
-                    ab += struct.pack('<H', t)
-                ab += struct.pack('<I', fnv32(tv))
-        ALTS += ab
 
         # LEAVES: u16 n + u16 token[n]；记录 2 字节对齐
         leaf_tokens = [tok_id[c] for c in leaves_orig[cp]]
@@ -1371,28 +1331,24 @@ def main():
         if len(ATOMS) & 1:
             ATOMS.append(0)
 
-        cs_off = len(CS)
-        CS += struct.pack('<H', len(comp_sorted))
-        for t in comp_sorted:
-            CS += struct.pack('<H', t)
-
         cold_off = len(COLD)
         COLD += struct.pack('<H', len(py_bytes)); COLD += py_bytes
         COLD += struct.pack('<H', len(ids_bytes)); COLD += ids_bytes
 
-        CHAR += struct.pack('<IIHBBIII',
+        # CHAR: 16 字节热记录 {freq, char_token, depth, block, leaf_off, atom_off}
+        CHAR += struct.pack('<IHBBII',
                             freq_score & 0xFFFFFFFF,
-                            len_mask & 0xFFFFFFFF,
                             ctok,
                             depth & 0xFF,
                             block_id & 0xFF,
-                            alts_off,
                             leaf_off,
                             atom_off)
-        COLD_IDX += struct.pack('<II', cs_off, cold_off)
+        COLD_IDX += struct.pack('<I', cold_off)
 
     # ---- VARIANTS (异体字映射) ----
-    VAR_OFF = [0] * N
+    # 稀疏索引：位图标记有异体字的字，后接这些字的 VAR 偏移。
+    VAR_MASK_WORDS = [0] * ((N + 31) // 32)
+    VAR_OFFSETS = []
     VAR = bytearray()
     variant_lists = {}
     if os.path.exists(VARIANTS_PATH):
@@ -1423,11 +1379,15 @@ def main():
     else:
         print(f"[Warning] {VARIANTS_PATH} not found, variants section empty.")
     for i, cp in enumerate(chars):
-        VAR_OFF[i] = len(VAR)
         ids = variant_lists.get(cp, [])
+        if not ids:
+            continue
+        VAR_MASK_WORDS[i >> 5] |= 1 << (i & 31)
+        VAR_OFFSETS.append(len(VAR))
         VAR += struct.pack('<H', len(ids))
         for vid in ids:
             VAR += struct.pack('<I', vid)
+    assert len(VAR_OFFSETS) == len(variant_lists)
 
     # ---- CP2ID / ID2CP ----
     CP2ID = bytearray(MAX_CP * 4)
@@ -1499,6 +1459,8 @@ def main():
     # ---- KEY_LOOKUP / KEY_REC / POST ----
     K = 1024
     BITSET_BYTES = ((N + 63) // 64) * 8
+    # 位图与升序 u32 数组的平衡点：4*cnt == BITSET_BYTES。
+    BITMAP_THRESHOLD = max(K, (BITSET_BYTES // 4))
     POST = bytearray()
 
     def align8():
@@ -1524,7 +1486,7 @@ def main():
         head_off = len(POST)
         for x in head_ids:
             POST += struct.pack('<I', x)
-        kind = 1 if cnt > K else 0
+        kind = 1 if cnt > BITMAP_THRESHOLD else 0
         align8()
         full_off = len(POST)
         if kind == 0:
@@ -1551,7 +1513,8 @@ def main():
 
     KL = b''.join(struct.pack('<I', x) for x in KEY_LOOKUP)
     CANON = bytes(TOK_CANON)
-    VAR_OFF_BLOB = b''.join(struct.pack('<I', x) for x in VAR_OFF)
+    VAR_OFF_BLOB = (b''.join(struct.pack('<I', w) for w in VAR_MASK_WORDS) +
+                    b''.join(struct.pack('<I', off) for off in VAR_OFFSETS))
 
     # 节区按“冷热”排列：热数据在前，减少首次查询触页跨度。
     # section type ids 必须与 src/ids_store.h 一致。
@@ -1561,7 +1524,6 @@ def main():
         (10, bytes(TB)), (17, CANON), (18, bytes(AS)), (11, bytes(PB)),
         (20, bytes(PC)),
         (6, bytes(LEAVES)), (7, bytes(ATOMS)), (19, bytes(LS)),
-        (5, bytes(ALTS)), (8, bytes(CS)),
         (14, bytes(POST)),
         (4, bytes(COLD_IDX)), (9, bytes(COLD)),
         (15, VAR_OFF_BLOB),
@@ -1579,7 +1541,7 @@ def main():
         table += struct.pack('<IIQQ', sec_type, 0, offset, len(data))
         blobs.append((offset, data))
         offset += len(data)
-    header = struct.pack('<4sHHIIIIII', b'IDS4', 3, 0, MAX_CP, N,
+    header = struct.pack('<4sHHIIIIII', b'IDS4', 4, 0, MAX_CP, N,
                          len(KEY_REC) // 20, len(sections), 0, 0)
 
     out = "ids_data.bin"

@@ -34,10 +34,10 @@ enum SectionType {
   kSecId2Cp = 2,
   kSecHot = 3,
   kSecColdIdx = 4,
-  kSecAlts = 5,
+  kSecAlts = 5,  // reserved (IDS4 v4)
   kSecLeaves = 6,
   kSecAtoms = 7,
-  kSecCompSet = 8,
+  kSecCompSet = 8,  // reserved (IDS4 v4)
   kSecCold = 9,
   kSecTokens = 10,
   kSecPy = 11,
@@ -52,8 +52,8 @@ enum SectionType {
   kSecPyChar = 20,
 };
 
-// 顶层部件多重集精确匹配的排序保底。普通 ALTS 伪精确匹配最高约 5700 万，
-// 普通混合叶序匹配最高约 6700 万，因此精确结构至少保底 7000 万。
+// 顶层部件多重集精确匹配的排序保底。普通混合叶序匹配最高约 6700 万，
+// 因此精确结构至少保底 7000 万。
 constexpr int64_t kExactStructureBonus = 20000000;
 constexpr int64_t kExactStructureFloor = 70000000;
 
@@ -78,24 +78,21 @@ inline uint32_t LeafStructHash(const uint16_t* tokens, size_t n) {
   return h;
 }
 
-// 每字热记录（24 字节）：按 id 直索引。
+// 每字热记录（16 字节）：按 id 直索引。
 struct HotRec {
   uint32_t freq = 0;
-  uint32_t flags = 0;  // bit L 置位表示存在长度为 L 的 alts 变体
   uint16_t char_token = kNoToken;
   uint8_t depth = 0;
   uint8_t block = 0;
-  uint32_t alts_off = 0;
   uint32_t leaf_off = 0;
   uint32_t atom_off = 0;
 };
-static_assert(sizeof(HotRec) == 24, "HotRec must match IDS4 CharRec");
+static_assert(sizeof(HotRec) == 16, "HotRec must match IDS4 CharRec");
 
 struct ColdIdxRec {
-  uint32_t cs_off = 0;
   uint32_t cold_off = 0;
 };
-static_assert(sizeof(ColdIdxRec) == 8, "ColdIdxRec must match IDS4");
+static_assert(sizeof(ColdIdxRec) == 4, "ColdIdxRec must match IDS4");
 
 struct KeyEntry {
   uint32_t head_off = 0;  // POST 区字节偏移
@@ -118,6 +115,13 @@ inline uint32_t Rd32(const uint8_t* p) {
   return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
          (static_cast<uint32_t>(p[2]) << 16) |
          (static_cast<uint32_t>(p[3]) << 24);
+}
+
+inline uint32_t Popcount32(uint32_t x) {
+  x = x - ((x >> 1) & 0x55555555u);
+  x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+  x = (x + (x >> 4)) & 0x0F0F0F0Fu;
+  return (x * 0x01010101u) >> 24;
 }
 
 // IDS4 数据仓库：mmap 惰性映射 + 稠密 id 直索引。
@@ -144,18 +148,6 @@ class IdsStore {
   const HotRec& Hot(uint32_t id) const {
     static const HotRec kEmpty;
     return id < num_chars_ ? hot_[id] : kEmpty;
-  }
-
-  // ALTS / COMPSET / COLD 记录指针。
-  const uint8_t* Alts(uint32_t id) const { return alts_ + hot_[id].alts_off; }
-  const uint8_t* CompSetRec(uint32_t id) const {
-    return compset_ + cold_idx_[id].cs_off;
-  }
-  // 直接取字典序升序的部件 id 列表。
-  void CompSet(uint32_t id, const uint16_t** out, uint16_t* n) const {
-    const uint8_t* p = CompSetRec(id);
-    *n = Rd16(p);
-    *out = reinterpret_cast<const uint16_t*>(p + 2);
   }
 
   // 预计算顶层叶子（原始字形 token）。
@@ -244,9 +236,17 @@ class IdsStore {
   void Variants(uint32_t id, const uint32_t** out, uint16_t* n) const {
     *n = 0;
     *out = nullptr;
-    if (!var_ || !var_off_ || id >= num_chars_)
+    if (!var_ || !var_mask_ || !var_off_ || id >= num_chars_)
       return;
-    const uint8_t* p = var_ + var_off_[id];
+    uint32_t word = id >> 5;
+    uint32_t bit = id & 31;
+    if (word >= var_mask_words_ || !(var_mask_[word] & (1u << bit)))
+      return;
+    uint32_t rank = 0;
+    for (uint32_t i = 0; i < word; ++i)
+      rank += Popcount32(var_mask_[i]);
+    rank += Popcount32(var_mask_[word] & ((1u << bit) - 1));
+    const uint8_t* p = var_ + var_off_[rank];
     *n = Rd16(p);
     *out = reinterpret_cast<const uint32_t*>(p + 2);
   }
@@ -356,12 +356,12 @@ class IdsStore {
   const uint32_t* id2cp_ = nullptr;
   const HotRec* hot_ = nullptr;
   const ColdIdxRec* cold_idx_ = nullptr;
-  const uint8_t* alts_ = nullptr;
   const uint8_t* leaves_ = nullptr;
   const uint8_t* atoms_ = nullptr;
-  const uint8_t* compset_ = nullptr;
   const uint8_t* cold_ = nullptr;
   const uint8_t* post_ = nullptr;
+  const uint32_t* var_mask_ = nullptr;
+  uint32_t var_mask_words_ = 0;
   const uint32_t* var_off_ = nullptr;
   const uint8_t* var_ = nullptr;
   const uint32_t* key_lookup_ = nullptr;

@@ -57,7 +57,7 @@ jobs:
 
           python3 dump_ids_v4.py ids_data.bin | tee /tmp/ids_dump.log
 
-          grep -q "Magic: IDS4 (Version 3)" /tmp/ids_dump.log
+          grep -q "Magic: IDS4 (Version 4)" /tmp/ids_dump.log
           grep -q "LEAF_STRUCT:" /tmp/ids_dump.log
           grep -q "PY_CHAR:" /tmp/ids_dump.log
           if grep -q "Error:" /tmp/ids_dump.log; then

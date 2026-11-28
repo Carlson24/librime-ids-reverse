@@ -141,7 +141,7 @@ local mu_chars = first_component("mu")
 ok(contains(mu_chars, "木") and contains(mu_chars, "目") and contains(mu_chars, "母"),
    "mu 部件候选")
 
-ok(store.version == 3, "数据版本为 IDS4 v3")
+ok(store.version == 4, "数据版本为 IDS4 v4")
 local sha_ids = I.get_component_candidates(store, "sha", full, 0)
 local sha_chars = chars(sha_ids)
 ok(#sha_ids > 100, "sha 候选数量 > 100")

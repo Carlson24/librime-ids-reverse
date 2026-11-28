@@ -105,10 +105,10 @@ Run it from `data/`; all input paths are relative. It reads `IDS_raw.TXT`,
 `ids_zitools.txt`, `ids_lv1.txt`, `EquivalentUnifiedIdeograph.txt`,
 `excel_sheet2_pinyin.json`, `ids_variants.txt`, and optionally
 `wanxiang_charset.dict.yaml`. It writes `ids_index.txt`, `ids_meta.txt`, and
-`ids_data.bin` (~30 MB). These outputs are git-ignored.
+`ids_data.bin` (~15.7 MB). These outputs are git-ignored.
 
-- The only supported format is **IDS4 v3** (`IDS4` magic, version 3).
-  `PY_CHAR` (section 20) is required; v2/v1 and IDS3 files must be regenerated.
+- The only supported format is **IDS4 v4** (`IDS4` magic, version 4).
+  `PY_CHAR` (section 20) is required; v3/v2/v1 and IDS3 files must be regenerated.
 - `PY_CHAR` maps every toneless pinyin (including `pypinyin` heteronyms) to all
   character ids, sorted by frequency. Exact single-syllable candidates are not
   capped; prefix matches keep the caller's limit.
@@ -142,7 +142,7 @@ Config defaults and normalization live in `ReverseConfig` and
 `LoadReverseConfig`; mirror them in the Lua `load_config` defaults.
 
 Load the store lazily through `EnsureIdsStoreLoaded` / `EnsureLoaded`; never
-load ~30 MB of data in a component constructor.
+load ~16 MB of data in a component constructor.
 
 ### Input encoding (`InputCodec`)
 
@@ -216,24 +216,25 @@ Variants use the properties `ids_reverse_variants` (base character) and
 `IdsStore` is a process-wide singleton with an mmap-backed IDS4 image:
 
 - Dense character ids `0..N-1`; `CP2ID` / `ID2CP` translation.
-- 24-byte hot record per character: frequency, flags, char token, depth, block,
-  and offsets into ALTS/LEAVES/ATOMS.
-- ALTS: ordered component variants grouped by length, plus signatures.
+- 16-byte hot record per character: frequency, char token, depth, block, and
+  offsets into LEAVES / ATOMS.
 - LEAVES / ATOMS: precomputed top-level and atomic component tokens.
-- COMPSET: sorted component ids per character.
 - Inverted index addressed by token id and multiplicity via `KEY_LOOKUP` /
   `KEY_REC`; `POST` holds a ranked `head` plus the full posting (sorted array,
-  or bitmap above 1024 entries).
+  or bitmap above the `4 * cnt == bitmap size` break-even point).
 - `PY` / `TOKENS`: pinyin-to-component and component token tables.
 - `PY_CHAR` (section 20, required): toneless pinyin -> all character ids,
   including heteronyms, sorted by frequency; feeds O-mode component candidates.
-- `VAR_OFF` / `VAR`: variants; `TOK_CANON` / `ATOMIC_SET`: precomputed sets.
+- `COLD_IDX` (4 bytes per character): offset into `COLD` for pinyin/IDS text.
+- `VAR_OFF` / `VAR`: sparse variant index (bitmap + offsets for characters with
+  variants); `TOK_CANON` / `ATOMIC_SET`: precomputed sets.
 - `LEAF_STRUCT`: sorted `{hash, id}` records for the canonical top-level leaf
   multiset; query by binary search and verify against `LEAVES` to tolerate hash
   collisions.
 
 Section ids 1–20 are declared in `ids_store.h` (`kSec*`), mirrored by `SEC_*`
-in `ids_reverse.lua`, and written by `data/generate_data_v4.py`. Any storage
+in `ids_reverse.lua`, and written by `data/generate_data_v4.py`. Section 5
+(ALTS) and 8 (COMPSET) are reserved and absent from v4 files. Any storage
 change must update all three and regenerate the binary.
 
 `LEAF_STRUCT` (section 19) is the canonical top-level leaf multiset index. It
@@ -307,7 +308,7 @@ one changed. Applies to:
 
 - Run the Lua functional test.
 - If the binary format or data inputs changed, regenerate `ids_data.bin` and
-  verify with `dump_ids_v4.py`. IDS4 v3 requires `LEAF_STRUCT` with one record
+  verify with `dump_ids_v4.py`. IDS4 v4 requires `LEAF_STRUCT` with one record
   per character and a non-empty `PY_CHAR` section.
 - If C++ changed, build the target and smoke-test the README scenarios in a
   frontend.

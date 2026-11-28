@@ -19,19 +19,17 @@ Lua 5.5 版见下文「Lua 5.5 版本」。
 
 ---
 
-## 数据格式（IDS4 v3）
+## 数据格式（IDS4 v4）
 
-单文件 `ids_data.bin`（约 30MB），面向**查询延迟**设计：`mmap` 惰性映射、
+单文件 `ids_data.bin`（约 15.7MB），面向**查询延迟**设计：`mmap` 惰性映射、
 稠密字 id、整数部件匹配、预计算叶子/原子部件、整数倒排键、每键连续 postings。
 
-> IDS4 v3 必须包含 `PY_CHAR` section。旧 v2/v1/IDS3 数据文件会在加载时报错，
+> IDS4 v4 必须包含 `PY_CHAR` section。旧 v3/v2/v1/IDS3 数据文件会在加载时报错，
 > 需要重新生成 `ids_data.bin`。
 
 - **稠密 id**：103k+ 汉字映射到 `0..N-1`（`CP2ID`/`ID2CP`）。
-- **CHAR**：每字 24 字节定长记录 `{freq, flags, char_token, depth, block,
-  alts_off, leaf_off, atom_off}`，一次 cache line 读取评分所需全部热字段。
-- **整数部件匹配**：15k+ 部件 token 表（`u16`）；alts 存成按长度分组的平坦
-  `u16` 序列 + 每变体 `u32` 有序签名。
+- **CHAR**：每字 16 字节定长记录 `{freq, char_token, depth, block,
+  leaf_off, atom_off}`，一次 cache line 读取评分所需全部热字段。
 - **预计算派生数据**：
   - `LEAVES`：每字顶层部件 token 序列，替代运行时 UTF-8 IDS 拆字；
   - `ATOMS`：每字原子部件 token 序列，替代运行时 `std::map<string,int>` 分解；
@@ -42,15 +40,18 @@ Lua 5.5 版见下文「Lua 5.5 版本」。
 - **倒排**：
   - `KEY_LOOKUP`/`KEY_REC`：按 `token_id + 重数` 直接寻址，不再哈希字符串键；
   - `POST`：每个键的 `head` 与完整集合连续存放；完整集合大键用**位图**、
-    其余用 id 升序 `u32`；位图阈值 `>1024`。
+    其余用 id 升序 `u32`；位图阈值按 `4 * cnt` 与位图大小的平衡点取约 `N / 32`。
   - 单 term 查询直接使用字频序 `head`，不再遍历十万级完整倒排。
 - **PY/TOKENS**：拼音→token、token 词表（含码点）。
 - **PY_CHAR**：无调拼音→全部字符 id（含异读、按字频降序），供 O 模式部件选择；
   完整单音节候选不设上限。
+- **COLD_IDX**：每字 4 字节 `cold_off`，指向 `COLD` 中的拼音/IDS 文本。
+- **VAR_OFF / VAR**：位图 + 稀疏偏移索引；只为有异体字的字保存偏移和变体记录。
 
 区间（section）采用节表，全部定长、小端、8 字节对齐，并按冷热排序：
 `CHAR → CP2ID → KEY_* → TOKENS → PY/PY_CHAR → LEAVES/ATOMS/LEAF_STRUCT →
-ALTS/COMPSET → POST → COLD → VAR → ID2CP`。
+POST → COLD → VAR → ID2CP`。Section 5（ALTS）和 8（COMPSET）保留为
+历史编号，v4 文件不再包含。
 
 ---
 
@@ -140,7 +141,7 @@ engine:
 
 ### 与 C++ 版的差异
 
-- Lua 版会在首次检字时把约 30MB 的 `ids_data.bin` 读入内存；C++ 版使用
+- Lua 版会在首次检字时把约 15.7MB 的 `ids_data.bin` 读入内存；C++ 版使用
   `mmap` 惰性映射。桌面端正常使用无影响。
 - Lua 的 `select_notifier` 没有 `at_front`，因此 O 模式会临时关闭
   `_auto_commit`，由 Lua 组件自己处理结果上屏和部件状态。
@@ -423,9 +424,9 @@ python3 generate_data_v4.py    # 依赖 pypinyin
 - `ids_variants.txt`（异体字表，`原始汉字\t异体字（空格分隔）`）
 - `wanxiang_charset.dict.yaml`（可选的本地字符集来源，不存在则跳过）
 
-产出 `ids_data.bin`（IDS4 v3，约 30MB）。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
+产出 `ids_data.bin`（IDS4 v4，约 15.7MB）。该文件被 `.gitignore` 忽略，需要本地生成或从发布包获取。
 
-> IDS4 v3 与 v2/v1、旧 IDS3 数据文件不兼容。升级插件后必须重新生成 `ids_data.bin`；
+> IDS4 v4 与 v3/v2/v1、旧 IDS3 数据文件不兼容。升级插件后必须重新生成 `ids_data.bin`；
 > 读取到旧版本号时会直接加载失败。
 
 数据检查：
@@ -445,7 +446,7 @@ python3 dump_ids_v4.py ids_data.bin
 在 GitHub 的 **Actions → Build and publish IDS data → Run workflow** 中运行。默认会：
 
 - 使用 Python 3.14 + `pypinyin==0.55.0` 生成 `ids_data.bin`；
-- 校验 IDS4 v3 结构并运行 Lua 功能测试；
+- 校验 IDS4 v4 结构并运行 Lua 功能测试；
 - 上传 `ids_data.bin` / `ids_data.bin.sha256` 作为 workflow artifact；
 - 创建或更新 `ids-data-latest` Release 并覆盖其中的资产。
 

@@ -36,8 +36,8 @@ def dump_ids4(bin_path, output_path=None, sample_count=None):
     if magic != b'IDS4':
         print(f"Error: Invalid magic {magic}, expected IDS4")
         return
-    if ver != 3:
-        print(f"Error: Unsupported IDS4 version {ver}, expected 3; "
+    if ver != 4:
+        print(f"Error: Unsupported IDS4 version {ver}, expected 4; "
               f"please regenerate ids_data.bin")
         return
 
@@ -107,16 +107,16 @@ def dump_ids4(bin_path, output_path=None, sample_count=None):
         cp = id2cp[cid]
         char_str = chr(cp)
 
-        # CHAR: freq u32, flags u32, char_token u16, depth u8, block u8,
-        #       alts_off u32, leaf_off u32, atom_off u32 (24 字节)
-        h_pos = char_off + cid * 24
-        freq, flags, char_token, depth, block_id, alts_off, leaf_off, atom_off = \
-            struct.unpack('<IIHBBIII', blob[h_pos: h_pos + 24])
+        # CHAR: freq u32, char_token u16, depth u8, block u8,
+        #       leaf_off u32, atom_off u32 (16 字节)
+        h_pos = char_off + cid * 16
+        freq, char_token, depth, block_id, leaf_off, atom_off = \
+            struct.unpack('<IHBBII', blob[h_pos: h_pos + 16])
         block_name = BLOCK_NAMES[block_id] if block_id < len(BLOCK_NAMES) else "未知"
 
-        # COLD_IDX: cs_off u32, cold_off u32
-        ci_pos = cold_idx_off + cid * 8
-        cs_off, c_off = struct.unpack('<II', blob[ci_pos: ci_pos + 8])
+        # COLD_IDX: cold_off u32
+        ci_pos = cold_idx_off + cid * 4
+        c_off = struct.unpack('<I', blob[ci_pos: ci_pos + 4])[0]
 
         # COLD: py_len u16, py bytes, ids_len u16, ids bytes
         c_pos = cold_off + c_off
@@ -133,18 +133,33 @@ def dump_ids4(bin_path, output_path=None, sample_count=None):
 
     # 异体字 section (15: VAR_OFF, 16: VAR)，存在则反解导出
     if 15 in sections and 16 in sections:
-        var_off_off, _ = sections[15]
+        var_off_off, var_off_len = sections[15]
         var_off, var_len = sections[16]
+        mask_words = (num_chars + 31) // 32
+        masks = struct.unpack(
+            f'<{mask_words}I',
+            blob[var_off_off: var_off_off + mask_words * 4])
+        offsets_off = var_off_off + mask_words * 4
+        offsets_count = (var_off_len - mask_words * 4) // 4
         var_offsets = struct.unpack(
-            f'<{num_chars}I', blob[var_off_off: var_off_off + num_chars * 4])
+            f'<{offsets_count}I',
+            blob[offsets_off: offsets_off + offsets_count * 4])
+        present = []
+        for wi, word in enumerate(masks):
+            while word:
+                bit = (word & -word).bit_length() - 1
+                vid = wi * 32 + bit
+                if vid < num_chars:
+                    present.append(vid)
+                word &= word - 1
         var_lines = []
-        for vid in range(num_chars):
-            p = var_off + var_offsets[vid]
+        for idx, vid in enumerate(present):
+            if idx >= len(var_offsets):
+                break
+            p = var_off + var_offsets[idx]
             if p + 2 > var_off + var_len:
                 break
             cnt = struct.unpack('<H', blob[p: p + 2])[0]
-            if cnt == 0:
-                continue
             variants = struct.unpack(f'<{cnt}I', blob[p + 2: p + 2 + cnt * 4])
             vchars = ' '.join(chr(id2cp[v]) for v in variants if v < num_chars)
             var_lines.append(f"{chr(id2cp[vid])}\t{vchars}")

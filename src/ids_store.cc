@@ -146,8 +146,8 @@ IdsStore::~IdsStore() = default;
 bool IdsStore::Parse() {
   if (size_ < 32 || std::memcmp(base_, "IDS4", 4) != 0)
     return false;
-  if (Rd16(base_ + 4) != 3)
-    return false;  // 仅支持 IDS4 v3（含必需 PY_CHAR section）。
+  if (Rd16(base_ + 4) != 4)
+    return false;  // 仅支持 IDS4 v4（含必需 PY_CHAR section）。
   max_cp_ = Rd32(base_ + 8);
   num_chars_ = Rd32(base_ + 12);
   uint32_t nkeys = Rd32(base_ + 16);
@@ -168,6 +168,7 @@ bool IdsStore::Parse() {
   uint64_t atomset_len = 0;
   const uint8_t* leaf_struct_sec = nullptr;
   uint64_t leaf_struct_len = 0;
+  uint64_t var_off_len = 0;
 
   for (uint32_t i = 0; i < nsec; ++i) {
     const uint8_t* e = st + static_cast<size_t>(i) * 24;
@@ -190,17 +191,11 @@ bool IdsStore::Parse() {
       case kSecColdIdx:
         cold_idx_ = reinterpret_cast<const ColdIdxRec*>(p);
         break;
-      case kSecAlts:
-        alts_ = p;
-        break;
       case kSecLeaves:
         leaves_ = p;
         break;
       case kSecAtoms:
         atoms_ = p;
-        break;
-      case kSecCompSet:
-        compset_ = p;
         break;
       case kSecCold:
         cold_ = p;
@@ -228,7 +223,8 @@ bool IdsStore::Parse() {
         post_ = p;
         break;
       case kSecVarOff:
-        var_off_ = reinterpret_cast<const uint32_t*>(p);
+        var_mask_ = reinterpret_cast<const uint32_t*>(p);
+        var_off_len = len;
         break;
       case kSecVar:
         var_ = p;
@@ -248,10 +244,18 @@ bool IdsStore::Parse() {
         break;
     }
   }
-  if (!cp2id_ || !id2cp_ || !hot_ || !cold_idx_ || !alts_ || !leaves_ ||
-      !atoms_ || !compset_ || !cold_ || !post_ || !key_lookup_ || !tokens_sec ||
-      !py_sec || !pychar_sec || !keyrec_sec || !leaf_struct_sec || !tok_canon_)
+  if (!cp2id_ || !id2cp_ || !hot_ || !cold_idx_ || !leaves_ || !atoms_ ||
+      !cold_ || !post_ || !key_lookup_ || !tokens_sec || !py_sec ||
+      !pychar_sec || !keyrec_sec || !leaf_struct_sec || !tok_canon_)
     return false;
+
+  // VAR_OFF: u32 mask[N/32] + u32 offsets[present_count]
+  if (var_mask_) {
+    var_mask_words_ = (num_chars_ + 31) / 32;
+    if (var_off_len < static_cast<uint64_t>(var_mask_words_) * 4)
+      return false;
+    var_off_ = var_mask_ + var_mask_words_;
+  }
 
   // LEAF_STRUCT: u32 count + count * {u32 hash, u32 id}
   if (leaf_struct_len < 4)
