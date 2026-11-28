@@ -16,17 +16,12 @@ struct Ticket;
 
 namespace ids_reverse {
 
-// 单个检字模式的配置：仅 tag / prefix / tips 按模式区分。
-struct ReverseModeConfig {
-  std::string prefix;
-  std::string tag;
-  std::string tips;
-};
-
 // ids_reverse 命名空间下的全部配置。
 struct ReverseConfig {
-  ReverseModeConfig search{"I", "ids_reverse_search", "〔部件检字〕"};
-  ReverseModeConfig hybrid{"O", "ids_reverse_hybrid", "〔汉字部件检字〕"};
+  // O 模式（部件/拼音/输入码混合检字）的触发配置。
+  std::string prefix = "O";
+  std::string tag = "ids_reverse_hybrid";
+  std::string tips = "〔汉字部件检字〕";
 
   std::string data_path = "ids_data.bin";
   std::string custom_path;

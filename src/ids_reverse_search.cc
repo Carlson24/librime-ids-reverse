@@ -1,5 +1,5 @@
 //
-// ids_reverse_search.cc — 混合检字实现。
+// ids_reverse_search.cc — O 模式混合检字实现。
 //
 #include "ids_reverse_search.h"
 

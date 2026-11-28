@@ -18,7 +18,7 @@
 
 namespace ids_reverse {
 
-// 同时处理 search / hybrid 两种输入模式。
+// 处理 O 模式（部件/拼音/输入码混合检字）的按键。
 class IdsReverseProcessor : public rime::Processor {
  public:
   explicit IdsReverseProcessor(const rime::Ticket& ticket);
@@ -50,7 +50,7 @@ class IdsReverseProcessor : public rime::Processor {
   bool has_variant_replace_key_ = false;
 };
 
-// search 模式整段打标签；hybrid 模式动态分段。
+// O 模式动态分段。
 class IdsReverseSegmentor : public rime::Segmentor {
  public:
   explicit IdsReverseSegmentor(const rime::Ticket& ticket);
@@ -60,18 +60,16 @@ class IdsReverseSegmentor : public rime::Segmentor {
   ReverseConfig config_;
 };
 
-// search 模式仅前缀不产生候选；hybrid 模式做单字过滤与去重。
+// O 模式做单字过滤与去重。
 class IdsReverseFilter : public rime::Filter {
  public:
   explicit IdsReverseFilter(const rime::Ticket& ticket);
 
-  bool AppliesToSegment(rime::Segment* segment) override;
   rime::an<rime::Translation> Apply(rime::an<rime::Translation> translation,
                                     rime::CandidateList* candidates) override;
 
  private:
   ReverseConfig config_;
-  bool suppress_ = false;
 };
 
 }  // namespace ids_reverse

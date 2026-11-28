@@ -8,10 +8,10 @@
 schema:
   schema_id: ids_reverse_lua
   name: "部件模糊检字（Lua）"
-  version: "1.8"
+  version: "1.9"
   author: "librime-ids-reverse"
   description: |
-    Lua 5.5 部件检字：I 模式 + O 模式混合检字。
+    Lua 5.5 部件检字：O 模式混合检字。
     直接复用 C++ 版的 ids_data.bin。
 
 switches:
@@ -73,10 +73,6 @@ ids_reverse:
   variant_trigger: "/"
   variant_replace_key: "Shift+V"
 
-  search_prefix: "I"
-  search_tag: ids_reverse_search
-  search_tips: "〔部件检字〕"
-
-  hybrid_prefix: "O"
-  hybrid_tag: ids_reverse_hybrid
-  hybrid_tips: "〔汉字部件检字〕"
+  prefix: "O"
+  tag: ids_reverse_hybrid
+  tips: "〔汉字部件检字〕"

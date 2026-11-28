@@ -152,19 +152,9 @@ ok(contains(sha_chars, "挲"), "sha 包含异读 挲")
 local sh_prefix = I.get_component_candidates(store, "sh", full, 10)
 ok(#sh_prefix == 10, "前缀候选保留上限")
 
-local function search(q, codec)
-  return I.search_components(store, q, 60, codec or full, nil)
-end
 local function hybrid(components, codec)
   return I.search_hybrid(store, components, codec or full, 60, nil)
 end
-
-local wood_mouth = chars(search("木口"))
-ok(contains(wood_mouth, "杏"), "I 木口 包含 杏")
-ok(#search("kouhao") > 0, "I kouhao")
-ok(#search("老六") > 0, "I 老六")
-ok(#search("木木木") > 0, "I 木木木")
-ok(#search("氵工") > 0, "I 氵工")
 
 local bi_tokens = { store:find_token("匕"), store:find_token("匕") }
 local bi_exact = store:lookup_leaf_structure(bi_tokens)
@@ -174,13 +164,6 @@ ok(not contains(chars(bi_exact), "昆"), "结构索引 匕匕 排除 昆")
 
 local le_exact = store:lookup_leaf_structure({ store:find_token("了") })
 ok(contains(chars(le_exact), "𠄏"), "结构索引 了 包含 𠄏")
-
-local i_bi = search("匕匕")
-ok(contains(chars(i_bi), "𫧇"), "I 匕匕 包含 𫧇")
-
-local i_le = search("了")
-ok(index_of(i_le, "𠄏") ~= nil,
-   "I 了 包含 𠄏")
 
 ok(I.format_ids("⿿了", "bracket") == "[旋转]了", "旋转操作符 bracket 格式")
 ok(I.format_ids("⿿了", "plain") == "了", "旋转操作符 plain 格式")

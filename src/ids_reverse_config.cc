@@ -125,12 +125,9 @@ void LoadReverseConfig(const rime::Ticket& ticket,
   if (!conf)
     return;
 
-  conf->GetString(ns + "/search_prefix", &config->search.prefix);
-  conf->GetString(ns + "/search_tag", &config->search.tag);
-  conf->GetString(ns + "/search_tips", &config->search.tips);
-  conf->GetString(ns + "/hybrid_prefix", &config->hybrid.prefix);
-  conf->GetString(ns + "/hybrid_tag", &config->hybrid.tag);
-  conf->GetString(ns + "/hybrid_tips", &config->hybrid.tips);
+  conf->GetString(ns + "/prefix", &config->prefix);
+  conf->GetString(ns + "/tag", &config->tag);
+  conf->GetString(ns + "/tips", &config->tips);
 
   conf->GetString(ns + "/data_file", &config->data_path);
   conf->GetString(ns + "/custom_file", &config->custom_path);
@@ -140,23 +137,12 @@ void LoadReverseConfig(const rime::Ticket& ticket,
   conf->GetString(ns + "/variant_replace_key", &config->variant_replace_key);
   conf->GetInt(ns + "/max_results", &config->max_results);
 
-  if (config->search.prefix.empty())
-    config->search.prefix = "I";
-  if (config->search.tag.empty())
-    config->search.tag = "ids_reverse_search";
-  if (config->search.tips.empty())
-    config->search.tips = "〔部件检字〕";
-  if (config->hybrid.prefix.empty())
-    config->hybrid.prefix = "O";
-  if (config->hybrid.tag.empty())
-    config->hybrid.tag = "ids_reverse_hybrid";
-  if (config->hybrid.tips.empty())
-    config->hybrid.tips = "〔汉字部件检字〕";
-  if (config->search.prefix == config->hybrid.prefix) {
-    LOG(WARNING)
-        << "ids_reverse: search_prefix and hybrid_prefix are identical ('"
-        << config->search.prefix << "'); search mode takes precedence";
-  }
+  if (config->prefix.empty())
+    config->prefix = "O";
+  if (config->tag.empty())
+    config->tag = "ids_reverse_hybrid";
+  if (config->tips.empty())
+    config->tips = "〔汉字部件检字〕";
 
   if (config->data_path.empty())
     config->data_path = "ids_data.bin";

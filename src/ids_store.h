@@ -7,7 +7,6 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -120,77 +119,6 @@ inline uint32_t Rd32(const uint8_t* p) {
          (static_cast<uint32_t>(p[2]) << 16) |
          (static_cast<uint32_t>(p[3]) << 24);
 }
-
-// 简单 LRU 缓存（供切分 / matcher / 查询结果缓存使用）。
-template <class Key, class Val>
-class LruCache {
- public:
-  explicit LruCache(size_t cap) : cap_(cap == 0 ? 1 : cap) {}
-
-  Val* Find(const Key& k) {
-    auto it = map_.find(k);
-    if (it == map_.end())
-      return nullptr;
-    order_.splice(order_.begin(), order_, it->second.order_it);
-    return &it->second.val;
-  }
-
-  Val& Ensure(const Key& k) {
-    auto it = map_.find(k);
-    if (it != map_.end()) {
-      order_.splice(order_.begin(), order_, it->second.order_it);
-      return it->second.val;
-    }
-    if (map_.size() >= cap_) {
-      Key oldest = order_.back();
-      order_.pop_back();
-      map_.erase(oldest);
-    }
-    auto res = map_.emplace(k, Entry{Val(), order_.end()});
-    order_.push_front(k);
-    res.first->second.order_it = order_.begin();
-    return res.first->second.val;
-  }
-
-  void Put(const Key& k, Val v) {
-    auto it = map_.find(k);
-    if (it != map_.end()) {
-      it->second.val = std::move(v);
-      order_.splice(order_.begin(), order_, it->second.order_it);
-      return;
-    }
-    if (map_.size() >= cap_) {
-      Key oldest = order_.back();
-      order_.pop_back();
-      map_.erase(oldest);
-    }
-    auto res = map_.emplace(k, Entry{std::move(v), order_.end()});
-    order_.push_front(k);
-    res.first->second.order_it = order_.begin();
-  }
-
-  void Erase(const Key& k) {
-    auto it = map_.find(k);
-    if (it == map_.end())
-      return;
-    order_.erase(it->second.order_it);
-    map_.erase(it);
-  }
-
-  void Clear() {
-    map_.clear();
-    order_.clear();
-  }
-
- private:
-  struct Entry {
-    Val val;
-    typename std::list<Key>::iterator order_it;
-  };
-  rime::hash_map<Key, Entry> map_;
-  std::list<Key> order_;
-  size_t cap_;
-};
 
 // IDS4 数据仓库：mmap 惰性映射 + 稠密 id 直索引。
 class IdsStore {

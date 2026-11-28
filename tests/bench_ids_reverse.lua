@@ -66,10 +66,6 @@ local function bench(fn, cold_iter, warm_iter)
 end
 
 local cases = {
-  { "I 单字 木", function() I.search_components(store, "木", 60, full, nil) end },
-  { "I 双部件 木口", function() I.search_components(store, "木口", 60, full, nil) end },
-  { "I 拼音 kouhao", function() I.search_components(store, "kouhao", 60, full, nil) end },
-  { "I 前缀 m", function() I.search_components(store, "m", 60, full, nil) end },
   { "O 单部件 木木", function() I.search_hybrid(store, { "木木" }, full, 60, nil) end },
   { "O 双部件 木口", function() I.search_hybrid(store, { "木口" }, full, 60, nil) end },
   { "O 减法 森木-", function() I.search_hybrid(store, { "森", "木", "-" }, full, 60, nil) end },

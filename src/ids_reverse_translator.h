@@ -33,18 +33,7 @@ class IdsReverseTranslator : public rime::Translator {
   bool EnsureLoaded();
   const InputCodec& Codec();
 
-  // search 模式：直接部件检索。
-  rime::an<rime::Translation> QuerySearch(const std::string& input,
-                                          const rime::Segment& segment);
-  rime::an<rime::Translation> BuildSearchCandidates(
-      const std::vector<uint32_t>& results,
-      const std::string& preedit,
-      size_t start_pos,
-      size_t end_pos);
-  std::vector<uint32_t> Search(const std::string& query_raw,
-                               const InputCodec& codec);
-
-  // hybrid 模式：部件/拼音/输入码混合检索。
+  // O 模式：部件/拼音/输入码混合检索。
   rime::an<rime::Translation> QueryHybrid(const rime::Segment& segment);
   void BuildResultCandidates(IdsStore& store,
                              const std::vector<uint32_t>& results,

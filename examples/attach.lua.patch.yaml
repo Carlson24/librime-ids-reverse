@@ -35,10 +35,6 @@ patch:
     variant_trigger: "/"
     variant_replace_key: "Shift+V"
 
-    search_prefix: "I"
-    search_tag: ids_reverse_search
-    search_tips: "〔部件检字〕"
-
-    hybrid_prefix: "O"
-    hybrid_tag: ids_reverse_hybrid
-    hybrid_tips: "〔汉字部件检字〕"
+    prefix: "O"
+    tag: ids_reverse_hybrid
+    tips: "〔汉字部件检字〕"

@@ -5,12 +5,12 @@ librime 插件：**部件检字（IDS 模糊搜字）翻译器**，C++ 原生实
 另提供一份单文件 **Lua 5.5** 实现 `ids_reverse.lua`，功能与 C++ 版对等，
 直接复用同一份 `ids_data.bin` 和 `ids_reverse` 配置。两者二选一挂载。
 
-包含两套模式：
-
-- **I 模式**：`I` + 部件/拼音，例如 `I木口`、`Ikouhao`，由原生 processor/segmentor 触发。
 - **O 模式**：`O` + 拼音/自定义编码混合检字，使用逆波兰后缀表达式 `-` 减法、`+` 加法、`!` 排除，支持回车字母直出、IDS 结构上屏。
 - **输入编码**：使用 `ids_reverse/algebra` 中的 Rime 拼写代数（spelling algebra）规则；留空即全拼，填入规则即可支持双拼、简拼、模糊音等。
 
+> I 模式已移除；`search_*` 与 `hybrid_*` 配置不再读取，请统一改为
+> `prefix` / `tag` / `tips`。`I` 前缀不再被插件拦截。
+>
 > O 模式的部件代数只支持逆波兰后缀表达式。旧的中缀写法、括号分组、
 > `algebra_notation` 配置以及“可减部件”提示均已移除。
 
@@ -60,13 +60,13 @@ ALTS/COMPSET → POST → COLD → VAR → ID2CP`。
 
 | 组件 | 类型 | 用途 |
 |---|---|---|
-| `ids_reverse_processor` | processor | search / hybrid 模式首次触发与按键处理 |
-| `ids_reverse_segmentor` | segmentor | search 整段打标签、hybrid 动态分段 |
-| `ids_reverse_translator` | translator | search 直接检字、hybrid 混合检字与部件候选 |
-| `ids_reverse_filter` | filter | search 前缀抑制、hybrid 单字过滤与去重 |
+| `ids_reverse_processor` | processor | O 模式首次触发与按键处理 |
+| `ids_reverse_segmentor` | segmentor | O 模式动态分段 |
+| `ids_reverse_translator` | translator | O 模式混合检字与部件候选 |
+| `ids_reverse_filter` | filter | O 模式单字过滤与去重 |
 
-两种模式共用同一个配置命名空间 `ids_reverse`。共享项放在顶层，
-只有 `tag`、`prefix`、`tips` 用 `search_` / `hybrid_` 前缀区分。
+O 模式使用配置命名空间 `ids_reverse`，由顶层的 `prefix`、`tag`、`tips`
+控制触发与提示。
 
 ---
 
@@ -156,7 +156,7 @@ engine:
 lua5.5 plugins/ids-reverse/tests/test_ids_reverse.lua
 ```
 
-测试会覆盖数据加载、全拼/拼写代数、I 模式、O 模式加减排除、异体字和多部件组合。
+测试会覆盖数据加载、全拼/拼写代数、O 模式加减排除、异体字和多部件组合。
 如果 `ids_data.bin` 不在默认位置，可作为参数传入：
 
 ```sh
@@ -173,9 +173,6 @@ lua5.5 plugins/ids-reverse/tests/bench_ids_reverse.lua
 
 | 场景 | 冷查询 | 缓存命中 |
 |---|---:|---:|
-| I 单字 `木` | ~0.4–0.8 ms | ~0.001 ms |
-| I 双部件 `木口` | ~10–17 ms | ~0.001 ms |
-| I 拼音 `kouhao` | ~0.7–1.2 ms | ~0.001 ms |
 | O 单部件 `木木` | ~1.4–2.7 ms | ~0.001 ms |
 | O 双部件 `木口` | ~9–10 ms | ~0.001 ms |
 | O 减法 `森木-` | ~1.4–2.6 ms | ~0.001 ms |
@@ -184,11 +181,9 @@ lua5.5 plugins/ids-reverse/tests/bench_ids_reverse.lua
 
 首次加载数据约 25–45 ms。首次构建拼写代数映射时，Lua 版约 100–200 ms
 （取决于规则数量），C++ 版通常低于 5 ms；之后走 codec 与查询缓存。
-I 模式双部件交叉检索是当前最慢的冷查询路径。
 
-同机 C++ 版冷查询大致为：I 双部件约 1 ms、O 单部件约 0.02 ms。Lua 版
-冷查询约为 C++ 的 10–50 倍，但 O 模式通常在 3 ms 内，结果缓存命中后低于
-0.001 ms；I 模式双部件首次查询约 10–17 ms。
+同机 C++ 版冷查询大致为：O 单部件约 0.02 ms。Lua 版冷查询约为 C++ 的
+10–50 倍，但 O 模式通常在 3 ms 内，结果缓存命中后低于 0.001 ms。
 
 ---
 
@@ -235,16 +230,10 @@ ids_reverse:
   variant_replace_key: "Shift+V" # 用选中异体字替换 preedit 原字
   # disabled_blocks: [扩A, 扩展B]
 
-  search_prefix: "I"
-  search_tag: ids_reverse_search
-  search_tips: "〔部件检字〕"
-
-  hybrid_prefix: "O"
-  hybrid_tag: ids_reverse_hybrid
-  hybrid_tips: "〔汉字部件检字〕"
+  prefix: "O"
+  tag: ids_reverse_hybrid
+  tips: "〔汉字部件检字〕"
 ```
-
-两种模式始终同时由同一套组件处理。若两个前缀相同，search 模式优先。
 
 ---
 
@@ -268,7 +257,7 @@ ids_reverse:
 `ids_data.bin` 的无调全拼音节表上，得到「输入码 → 标准拼音」映射，再进行
 切分和查询。因此：
 
-- 不配置 `algebra` 时，输入码就是全拼，`Ikouhao`、`Omukou` 等可直接使用。
+- 不配置 `algebra` 时，输入码就是全拼，`Omukou` 等可直接使用。
 - 配置双拼规则后，严格按规则解码；规则没有保留的全拼不再自动接受。
   例如 flypy 规则下输入 `Okz` 得到 `kou`，但 `Okou` 不会被当成 `kou`。
 - 简拼、模糊音等通过 `abbrev` / `fuzz` / `derive` 规则启用。
@@ -276,15 +265,7 @@ ids_reverse:
 
 ---
 
-## I 模式（search）
-
-- `I` + 部件/拼音，例如 `I木口`、`Ikouhao`。
-- 由 `ids_reverse_processor` 接收首个大写 `I`，`ids_reverse_segmentor`
-  为输入打上 `search_tag`，不再依赖 `recognizer` 或 `matcher`。
-- 单独的 `I` 会由 `ids_reverse_filter` 清空候选，只保留提示。
-- 使用 `search_prefix`、`search_tag`、`search_tips`。
-
-### IDS 展示格式
+## IDS 展示格式
 
 | `ids_format` | 效果 |
 |---|---|
@@ -294,7 +275,7 @@ ids_reverse:
 
 ---
 
-## O 模式（hybrid）
+## O 模式
 
 - `O` + 拼音/输入码：例如全拼下的 `Omu`、`Omukou`，或配置双拼 algebra 后的 `Okz`。选中部件后，输入编码会被
   替换为所选汉字并保留在组字区，例如 `Oshao` → 选 `少` → `O少`。
@@ -354,7 +335,7 @@ ids_reverse:
   得到 `葵` 后按 `/`，再选 `𦷡` 并替换，preedit 变为 `O艹癸𦷡`。替换后异体字会
   作为当前结果/部件存在：按空格直接上屏；继续输入运算符时，会以该异体字为
   部件继续运算，例如 `O葵/` 替换后输入 `亻-`。
-- 使用 `hybrid_prefix`、`hybrid_tag`、`hybrid_tips`。
+- 使用 `prefix`、`tag`、`tips`。
 - **原始字形优先**：候选 `LEAVES` 中保留的原始字形与查询部件精确匹配时优先显示，
   例如 `O纟目少` 首选 `缈`，`O龙` 优先含 `龙` 的字而不是 `龍`。原始字形命中相同
   时再按结构分、字频兜底。
@@ -413,15 +394,12 @@ patch:
     ids_format: unicode
     variant_trigger: "/"
     variant_replace_key: "Shift+V"
-    search_prefix: "I"
-    search_tag: ids_reverse_search
-    search_tips: "〔部件检字〕"
-    hybrid_prefix: "O"
-    hybrid_tag: ids_reverse_hybrid
-    hybrid_tips: "〔汉字部件检字〕"
+    prefix: "O"
+    tag: ids_reverse_hybrid
+    tips: "〔汉字部件检字〕"
 ```
 
-I 模式和 O 模式都不再依赖 `recognizer/patterns/ids_reverse` 和 `matcher`。
+O 模式不再依赖 `recognizer/patterns/ids_reverse` 和 `matcher`。
 现有方案中的 `matcher`/`recognizer` 可以保留，用于其他规则。
 
 或者直接使用 `examples/ids_reverse.schema.yaml` 作为独立检字方案。
@@ -505,15 +483,6 @@ cmake --build build --target rime-ids-reverse
 
 以下示例假定 `ids_reverse/algebra` 留空（全拼）。若配置了双拼等规则，请按
 规则对应的编码验证，例如 flypy 下 `Okz` 对应全拼的 `Okou`。
-
-I 模式：
-
-- `I木口`
-- `Ikouhao`
-- `I老六`
-- `I木木木`
-- `I氵工`
-- `I匕匕` → 结果包含 `𫧇`
 
 O 模式：
 

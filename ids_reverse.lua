@@ -1832,10 +1832,6 @@ end
 
 local seg_cache = {}
 local prefix_cache = {}
-local matcher_cache = {}
-local rank_cache = {}
-local query_cache = {}
-local term_cache = {}
 local hybrid_cache = {}
 
 local function cache_get(cache, key)
@@ -1856,8 +1852,7 @@ local function cache_put(cache, key, value, limit)
 end
 
 local function clear_query_caches()
-  for _, cache in ipairs({ seg_cache, prefix_cache, matcher_cache, rank_cache,
-                           query_cache, term_cache, hybrid_cache }) do
+  for _, cache in ipairs({ seg_cache, prefix_cache, hybrid_cache }) do
     for k in pairs(cache) do cache[k] = nil end
   end
 end
@@ -1872,582 +1867,7 @@ local function segment_alpha_string(store, chunk, codec)
   return result
 end
 
--- ---------------------------------------------------------------------------
--- 通用查询：term / posting / 打分
--- ---------------------------------------------------------------------------
 
-local function make_matcher(tokens)
-  local m = { list = tokens, set = {} }
-  for _, t in ipairs(tokens) do m.set[t] = true end
-  return m
-end
-
-local function matcher_has(m, t)
-  return m.set[t] == true
-end
-
-local function get_comps_by_prefix(store, pref)
-  if pref == "" then return nil end
-  local hit = cache_get(prefix_cache, pref)
-  if hit then
-    if #hit == 0 then return nil end
-    return hit
-  end
-  local res = {}
-  local seen = {}
-  local pref_len = #pref
-  for py, tokens in pairs(store.py_map) do
-    if #py >= pref_len and py:sub(1, pref_len) == pref then
-      for _, t in ipairs(tokens) do
-        if not seen[t] then
-          seen[t] = true
-          res[#res + 1] = t
-        end
-      end
-    end
-  end
-  if #res > 1 then
-    table.sort(res, function(a, b)
-      local function freq(t)
-        local cp = store:token_cp_of(t)
-        local id = cp ~= 0 and store:id_of_cp(cp) or INVALID_ID
-        return id == INVALID_ID and 0 or store:hot(id).freq
-      end
-      return freq(a) > freq(b)
-    end)
-  end
-  cache_put(prefix_cache, pref, res, 128)
-  if #res == 0 then return nil end
-  return res
-end
-
-local function get_term_matcher(store, term)
-  local hit = cache_get(matcher_cache, term)
-  if hit then return hit end
-  local v = {}
-  local py = store.py_map[term]
-  if py and #py > 0 then
-    for _, t in ipairs(py) do v[#v + 1] = t end
-  else
-    local pref = get_comps_by_prefix(store, term)
-    if pref and #pref > 0 then
-      for _, t in ipairs(pref) do v[#v + 1] = t end
-    else
-      local t = store:find_token(term)
-      if t ~= nil then v[#v + 1] = t end
-      local c = canon(term)
-      if c ~= term then
-        t = store:find_token(c)
-        if t ~= nil then v[#v + 1] = t end
-      end
-    end
-  end
-  table.sort(v)
-  local uniq = {}
-  local last
-  for _, t in ipairs(v) do
-    if t ~= last then uniq[#uniq + 1] = t; last = t end
-  end
-  local m = make_matcher(uniq)
-  cache_put(matcher_cache, term, m, 128)
-  return m
-end
-
-local function get_direct_comp_rank(store, term)
-  local hit = cache_get(rank_cache, term)
-  if hit then return hit end
-  local rank = {}
-  local r = 1
-  local py = store.py_map[term]
-  if py then
-    for _, t in ipairs(py) do
-      local cp = store:token_cp_of(t)
-      if cp > 0 and not rank[cp] then
-        rank[cp] = r
-        r = r + 1
-      end
-    end
-  else
-    local cp = 0
-    local t = store:resolve_term(term)
-    if t ~= nil then cp = store:token_cp_of(t) end
-    if cp == 0 then
-      cp = decode_next(term, 0)
-    end
-    if cp > 0 and not rank[cp] then rank[cp] = r end
-  end
-  cache_put(rank_cache, term, rank, 64)
-  return rank
-end
-
-local function parse_query(store, raw_query, codec)
-  local lower = ascii_lower(raw_query)
-  local items = {}
-  if has_separator(lower) then
-    for _, part in ipairs(split_separator(lower)) do
-      if part ~= "" then
-        local segs = segment_alpha_string(store, part, codec)
-        for _, s in ipairs(segs) do items[#items + 1] = s end
-      end
-    end
-  elseif is_ascii_alpha_only(lower) then
-    items = segment_alpha_string(store, lower, codec)
-  else
-    local cur = {}
-    for _, ch in ipairs(utf8_chars(lower)) do
-      if #ch == 1 and ch:byte() >= 97 and ch:byte() <= 122 then
-        cur[#cur + 1] = ch
-      else
-        if #cur > 0 then
-          local segs = segment_alpha_string(store, table.concat(cur), codec)
-          for _, s in ipairs(segs) do items[#items + 1] = s end
-          cur = {}
-        end
-        items[#items + 1] = ch
-      end
-    end
-    if #cur > 0 then
-      local segs = segment_alpha_string(store, table.concat(cur), codec)
-      for _, s in ipairs(segs) do items[#items + 1] = s end
-    end
-  end
-  local pq = { items = items, order = {}, counts = {} }
-  for _, item in ipairs(items) do
-    if pq.counts[item] == nil then
-      pq.counts[item] = 1
-      pq.order[#pq.order + 1] = item
-    else
-      pq.counts[item] = pq.counts[item] + 1
-    end
-  end
-  return pq
-end
-
-local function bipartite_match(comps, total, matchers, used, idx)
-  if idx > total then return true end
-  for j = 1, total do
-    if not used[j] and matcher_has(matchers[j], comps[idx]) then
-      used[j] = true
-      if bipartite_match(comps, total, matchers, used, idx + 1) then
-        return true
-      end
-      used[j] = false
-    end
-  end
-  return false
-end
-
-local function check_direct_match(store, alts_off, total, matchers,
-                                  all_singleton, target_sig)
-  if total == 0 or total > 64 then return 0 end
-  local blob = store.blob
-  local p = store.alts_off + alts_off
-  local ng = rd8(blob, p)
-  p = p + 1
-  local best = 0
-  for _ = 1, ng do
-    local L = rd8(blob, p)
-    p = p + 1
-    local nv = rd16(blob, p)
-    p = p + 2
-    if L ~= total then
-      p = p + nv * (L * 2 + 4)
-    else
-      for _ = 1, nv do
-        local tok = p
-        local ordered = false
-        if not all_singleton or rd32(blob, tok + L * 2) == target_sig then
-          ordered = true
-          for i = 1, total do
-            if not matcher_has(matchers[i], rd16(blob, tok + (i - 1) * 2)) then
-              ordered = false
-              break
-            end
-          end
-        end
-        if ordered then return 2 end
-        if best < 1 then
-          if total == 2 then
-            local c0 = rd16(blob, tok)
-            local c1 = rd16(blob, tok + 2)
-            local m0, m1 = matchers[1], matchers[2]
-            if (matcher_has(m0, c0) and matcher_has(m1, c1))
-               or (matcher_has(m0, c1) and matcher_has(m1, c0)) then
-              best = 1
-            end
-          elseif total == 3 then
-            local c0 = rd16(blob, tok)
-            local c1 = rd16(blob, tok + 2)
-            local c2 = rd16(blob, tok + 4)
-            local m0, m1, m2 = matchers[1], matchers[2], matchers[3]
-            if (matcher_has(m0, c0) and
-                ((matcher_has(m1, c1) and matcher_has(m2, c2)) or
-                 (matcher_has(m1, c2) and matcher_has(m2, c1))))
-               or (matcher_has(m0, c1) and
-                ((matcher_has(m1, c0) and matcher_has(m2, c2)) or
-                 (matcher_has(m1, c2) and matcher_has(m2, c0))))
-               or (matcher_has(m0, c2) and
-                ((matcher_has(m1, c0) and matcher_has(m2, c1)) or
-                 (matcher_has(m1, c1) and matcher_has(m2, c0)))) then
-              best = 1
-            end
-          else
-            local comps = {}
-            for i = 1, total do comps[i] = rd16(blob, tok + (i - 1) * 2) end
-            local used = {}
-            if bipartite_match(comps, total, matchers, used, 1) then best = 1 end
-          end
-        end
-        p = p + L * 2 + 4
-      end
-    end
-  end
-  return best
-end
-
-local function compute_match_sig(matchers)
-  local all_singleton = true
-  for i = 1, #matchers do
-    if #matchers[i].list ~= 1 then all_singleton = false; break end
-  end
-  local target_sig = 2166136261
-  if all_singleton then
-    for i = 1, #matchers do
-      local v = matchers[i].list[1]
-      target_sig = target_sig ~ (v & 0xFF)
-      target_sig = (target_sig * 16777619) & 0xFFFFFFFF
-      target_sig = target_sig ~ ((v >> 8) & 0xFF)
-      target_sig = (target_sig * 16777619) & 0xFFFFFFFF
-    end
-  end
-  return all_singleton, target_sig
-end
-
-local function top_k_ids(ids, scores, n, k)
-  if n == 0 or k <= 0 then return {} end
-  if n <= k then
-    local idx = {}
-    for i = 1, n do idx[i] = i end
-    table.sort(idx, function(a, b)
-      local sa, sb = scores[a], scores[b]
-      if sa ~= sb then return sa > sb end
-      return a < b
-    end)
-    local out = {}
-    for i = 1, n do out[i] = ids[idx[i]] end
-    return out
-  end
-  -- 最小堆维护 Top-K（堆顶为当前第 K 大），分数相同时索引更小者优先保留
-  local h_id, h_sc, h_ord = {}, {}, {}
-  local function less(i, sc, ord)
-    local si = h_sc[i]
-    if si ~= sc then return si < sc end
-    return h_ord[i] > ord
-  end
-  local function sift_down(p)
-    while true do
-      local l = p * 2
-      if l > k then break end
-      local c = l
-      local r = l + 1
-      if r <= k and less(r, h_sc[l], h_ord[l]) then c = r end
-      if less(c, h_sc[p], h_ord[p]) then
-        h_id[p], h_id[c] = h_id[c], h_id[p]
-        h_sc[p], h_sc[c] = h_sc[c], h_sc[p]
-        h_ord[p], h_ord[c] = h_ord[c], h_ord[p]
-        p = c
-      else
-        break
-      end
-    end
-  end
-  for i = 1, k do
-    h_id[i], h_sc[i], h_ord[i] = ids[i], scores[i], i
-  end
-  for i = k >> 1, 1, -1 do sift_down(i) end
-  for i = k + 1, n do
-    local sc = scores[i]
-    local top_sc = h_sc[1]
-    if sc > top_sc or (sc == top_sc and i < h_ord[1]) then
-      h_id[1], h_sc[1], h_ord[1] = ids[i], sc, i
-      sift_down(1)
-    end
-  end
-  local idx = {}
-  for i = 1, k do idx[i] = i end
-  table.sort(idx, function(a, b)
-    local sa, sb = h_sc[a], h_sc[b]
-    if sa ~= sb then return sa > sb end
-    return h_ord[a] < h_ord[b]
-  end)
-  local out = {}
-  for i = 1, k do out[i] = h_id[idx[i]] end
-  return out
-end
-
-local function score_candidate(store, id, matchers, order_count,
-                               all_singleton, target_sig)
-  local freq, flags, char_token, depth, alts_off = store:hot_score_fields(id)
-  local total = #matchers
-  if order_count == 1 and total == 1 then
-    if char_token ~= NO_TOKEN and matcher_has(matchers[1], char_token) then
-      return 30000000 + freq
-    end
-  end
-  local mt = 0
-  if total >= 1 and total <= 31 and (flags & (1 << total)) ~= 0 then
-    if all_singleton == nil then
-      all_singleton, target_sig = compute_match_sig(matchers)
-    end
-    mt = check_direct_match(store, alts_off, total, matchers,
-                            all_singleton, target_sig)
-  end
-  local common_bonus = freq >= 1900000 and 5000000 or 0
-  if mt == 2 then return 50000000 + common_bonus + freq end
-  if mt == 1 then return 40000000 + common_bonus + freq end
-  return freq - depth * 1000
-end
-
-local function add_posting_cps(store, key, limit, quota, cp_list, seen,
-                               disabled_blocks)
-  local e = store:find_key(key)
-  if not e or e.full_cnt == 0 then return end
-  local read = math.min(e.head_cnt, quota)
-  local head = store:head_ids(e, read)
-  local added = 0
-  for _, id in ipairs(head) do
-    if not seen[id] then
-      seen[id] = true
-      local keep = true
-      if disabled_blocks and disabled_blocks[store:hot(id).block] then
-        keep = false
-      end
-      if keep then
-        cp_list[#cp_list + 1] = id
-        added = added + 1
-        if #cp_list >= limit or added >= quota then return end
-      end
-    end
-  end
-  if #cp_list >= limit or read < e.head_cnt then return end
-  store:for_each_full(e, function(id)
-    if seen[id] then return true end
-    seen[id] = true
-    local keep = true
-    if disabled_blocks and disabled_blocks[store:hot(id).block] then
-      keep = false
-    end
-    if keep then
-      cp_list[#cp_list + 1] = id
-      added = added + 1
-      if #cp_list >= limit then return false end
-    end
-    return true
-  end)
-end
-
-local function add_single_cp(store, cp_list, seen, limit, ch, disabled_blocks)
-  local cp = decode_next(ch, 0)
-  local id = cp ~= 0 and store:id_of_cp(cp) or INVALID_ID
-  if id == INVALID_ID or seen[id] then return false end
-  seen[id] = true
-  if disabled_blocks and disabled_blocks[store:hot(id).block] then
-    return false
-  end
-  cp_list[#cp_list + 1] = id
-  return #cp_list >= limit
-end
-
-local function get_candidates_for_term(store, term, count, max_chars,
-                                       custom_keys, disabled_blocks,
-                                       is_multi_term)
-  local cp_list = {}
-  local seen = {}
-  local limit = max_chars == 0 and 200000 or max_chars
-  local cn_term = canon(term)
-
-  if count == 1 and not is_multi_term then
-    if (store:has_key(cn_term) or store:has_key(term))
-       and not (term:sub(1, 1) == "{") then
-      if add_single_cp(store, cp_list, seen, limit, cn_term, disabled_blocks) then
-        return cp_list
-      end
-      if cn_term ~= term then
-        if add_single_cp(store, cp_list, seen, limit, term, disabled_blocks) then
-          return cp_list
-        end
-      end
-    end
-    local pit = store.py_map[term]
-    if pit then
-      for _, t in ipairs(pit) do
-        local comp = store:token_str_of(t)
-        if comp:sub(1, 1) ~= "{" then
-          if add_single_cp(store, cp_list, seen, limit, comp, disabled_blocks) then
-            return cp_list
-          end
-        end
-      end
-    end
-  end
-
-  if custom_keys and #custom_keys > 0 then
-    local quota = #custom_keys <= 2 and limit
-                  or math.max(60, limit // #custom_keys)
-    for _, k in ipairs(custom_keys) do
-      add_posting_cps(store, k, limit, quota, cp_list, seen, disabled_blocks)
-      if #cp_list >= limit then break end
-    end
-    if #cp_list < limit then
-      for _, k in ipairs(custom_keys) do
-        add_posting_cps(store, k, limit, limit, cp_list, seen, disabled_blocks)
-        if #cp_list >= limit then break end
-      end
-    end
-  else
-    local has_cn = store:has_key(cn_term)
-    local has_term = store:has_key(term)
-    local has_cn_n = count > 1 and store:has_key(cn_term .. "*" .. count)
-    local has_term_n = count > 1 and store:has_key(term .. "*" .. count)
-    if has_cn or has_term or has_cn_n or has_term_n then
-      local key = nil
-      if count > 1 then
-        if has_cn_n then key = cn_term .. "*" .. count
-        elseif has_term_n then key = term .. "*" .. count end
-      end
-      if not key then
-        if has_cn then key = cn_term else key = term end
-      end
-      add_posting_cps(store, key, limit, limit, cp_list, seen, disabled_blocks)
-    else
-      local pit = store.py_map[term]
-      if pit then
-        local comps = pit
-        local quota = #comps <= 2 and limit
-                      or math.max(60, limit // #comps)
-        local function emit(q)
-          for _, t in ipairs(comps) do
-            local key = count > 1 and (store:token_str_of(t) .. "*" .. count)
-                                    or store:token_str_of(t)
-            if store:has_key(key) then
-              add_posting_cps(store, key, limit, q, cp_list, seen,
-                              disabled_blocks)
-            end
-            if #cp_list >= limit then return end
-          end
-        end
-        emit(quota)
-        if #cp_list < limit then emit(limit) end
-      else
-        local pref = get_comps_by_prefix(store, term)
-        if pref and #pref > 0 then
-          local quota = math.max(60, limit // math.max(1, #pref))
-          for _, t in ipairs(pref) do
-            local key = count > 1 and (store:token_str_of(t) .. "*" .. count)
-                                    or store:token_str_of(t)
-            if store:has_key(key) then
-              add_posting_cps(store, key, limit, quota, cp_list, seen,
-                              disabled_blocks)
-            end
-            if #cp_list >= limit then break end
-          end
-        end
-      end
-    end
-  end
-  return cp_list
-end
-
-local function build_term_info(store, term, mult)
-  local info = { term = term, mult = mult, is_pref = false, comps = {},
-                 tokens = {}, post_keys = {}, data_size = 0 }
-  local cn_term = canon(term)
-  local comps = {}
-  local is_pref = false
-  local pit = store.py_map[term]
-  if pit then
-    for _, t in ipairs(pit) do comps[#comps + 1] = store:token_str_of(t) end
-  elseif store:has_key(cn_term) or store:has_key(term) then
-    comps[#comps + 1] = cn_term
-    if cn_term ~= term then comps[#comps + 1] = term end
-  else
-    local pref = get_comps_by_prefix(store, term)
-    if pref then
-      for _, t in ipairs(pref) do comps[#comps + 1] = store:token_str_of(t) end
-      is_pref = true
-    else
-      comps[#comps + 1] = cn_term
-      if cn_term ~= term then comps[#comps + 1] = term end
-    end
-  end
-  info.is_pref = is_pref
-  info.comps = comps
-  local tokens, seen_tok = {}, {}
-  for _, c in ipairs(comps) do
-    local t = store:resolve_term(c)
-    if t ~= nil and not seen_tok[t] then
-      seen_tok[t] = true
-      tokens[#tokens + 1] = t
-    end
-  end
-  table.sort(tokens)
-  info.tokens = tokens
-
-  local max_keys = is_pref and 25 or 250
-  local seen_post = {}
-  for _, c in ipairs(comps) do
-    local cn = canon(c)
-    local suffix = mult > 1 and ("*" .. mult) or ""
-    local k1 = c .. suffix
-    local k2 = cn .. suffix
-    local use_k
-    if store:has_key(k2) then use_k = k2
-    elseif store:has_key(k1) then use_k = k1
-    elseif mult > 1 then
-      if store:has_key(cn) then use_k = cn
-      elseif store:has_key(c) then use_k = c end
-    end
-    if use_k and not seen_post[use_k] then
-      seen_post[use_k] = true
-      info.post_keys[#info.post_keys + 1] = use_k
-      if #info.post_keys >= max_keys then break end
-    end
-  end
-  local sz = 0
-  for _, k in ipairs(info.post_keys) do
-    local e = store:find_key(k)
-    if e then sz = sz + e.full_cnt * 4 end
-  end
-  info.data_size = sz
-  return info
-end
-
-local function get_candidates_for_term_full(store, info, disabled_blocks)
-  local ids, seen = {}, {}
-  for _, key in ipairs(info.post_keys) do
-    local e = store:find_key(key)
-    if e and e.full_cnt > 0 then
-      local head = store:head_ids(e)
-      for _, id in ipairs(head) do
-        if not seen[id] then
-          seen[id] = true
-          if not (disabled_blocks and disabled_blocks[store:hot(id).block]) then
-            ids[#ids + 1] = id
-          end
-        end
-      end
-      store:for_each_full(e, function(id)
-        if seen[id] then return true end
-        seen[id] = true
-        if not (disabled_blocks and disabled_blocks[store:hot(id).block]) then
-          ids[#ids + 1] = id
-        end
-        return true
-      end)
-    end
-  end
-  return ids
-end
 
 local function disabled_cache_key(disabled)
   if not disabled or next(disabled) == nil then return "" end
@@ -2457,26 +1877,6 @@ local function disabled_cache_key(disabled)
   return ":blk=" .. table.concat(ks, ",")
 end
 
-local function lookup_exact_query(store, pq, disabled_blocks)
-  local tokens = {}
-  for _, term in ipairs(pq.order) do
-    local t = store:resolve_term(term)
-    if t == nil then return {} end
-    for _ = 1, pq.counts[term] do tokens[#tokens + 1] = t end
-  end
-  if #tokens == 0 then return {} end
-  local ids = store:lookup_leaf_structure(tokens)
-  if disabled_blocks then
-    local filtered = {}
-    for _, id in ipairs(ids) do
-      if not disabled_blocks[store:hot_block(id)] then
-        filtered[#filtered + 1] = id
-      end
-    end
-    ids = filtered
-  end
-  return ids
-end
 
 local function merge_exact_first(exact, broad)
   local exact_set, seen, merged = {}, {}, {}
@@ -2566,190 +1966,6 @@ local function bitmap_intersect_words(store, term_words, disabled_blocks)
   return result
 end
 
-local function search_components(store, query_str, max_results, codec,
-                                 disabled_blocks)
-  if query_str == "" then return {} end
-  local cache_key = query_str .. ":" .. max_results .. ":" .. codec.id
-                      .. disabled_cache_key(disabled_blocks)
-  local hit = cache_get(query_cache, cache_key)
-  if hit then return hit end
-
-  local pq = parse_query(store, query_str, codec)
-  if #pq.order == 0 then return {} end
-
-  local matchers = {}
-  for _, item in ipairs(pq.items) do
-    matchers[#matchers + 1] = get_term_matcher(store, item)
-  end
-  local order_count = #pq.order
-
-  if order_count == 1 then
-    local term = pq.order[1]
-    local direct_rank = get_direct_comp_rank(store, term)
-    local is_pref = not store.valid_pinyins[term]
-                    and get_comps_by_prefix(store, term) ~= nil
-    local limit = is_pref and math.max(250, max_results * 3)
-                         or math.max(480, max_results * 8)
-    local cands = get_candidates_for_term(store, term, pq.counts[term], limit,
-                                          nil, disabled_blocks, false)
-    local exact = lookup_exact_query(store, pq, disabled_blocks)
-    local exact_set
-    cands, exact_set = merge_exact_first(exact, cands)
-    if #cands == 0 then
-      cache_put(query_cache, cache_key, {}, 256)
-      return {}
-    end
-    local all_singleton, target_sig = compute_match_sig(matchers)
-    local n_cands = #cands
-    local scores = {}
-    for i = 1, n_cands do
-      local id = cands[i]
-      local sc = score_candidate(store, id, matchers, order_count,
-                                 all_singleton, target_sig)
-      if pq.counts[term] == 1 and #matchers == 1 and direct_rank then
-        local cp = store:cp_of_id(id)
-        local r = direct_rank[cp]
-        if r then
-          sc = 40000000 + store:hot_freq(id) - r * 10
-        end
-      end
-      if exact_set[id] then sc = boost_exact_structure(sc) end
-      scores[i] = sc
-    end
-    local results = top_k_ids(cands, scores, n_cands, max_results)
-    cache_put(query_cache, cache_key, results, 256)
-    return results
-  end
-
-  local terms_info = {}
-  for _, term in ipairs(pq.order) do
-    local mult = pq.counts[term]
-    local k = term .. ":" .. mult
-    local sp = cache_get(term_cache, k)
-    if not sp then
-      sp = build_term_info(store, term, mult)
-      cache_put(term_cache, k, sp, 200)
-    end
-    if #sp.comps > 0 then terms_info[#terms_info + 1] = sp end
-  end
-  if #terms_info == 0 then return {} end
-  table.sort(terms_info, function(a, b) return a.data_size < b.data_size end)
-
-  local has_any_pref = false
-  for _, t in ipairs(terms_info) do
-    if t.is_pref then has_any_pref = true; break end
-  end
-
-  local base = nil
-  for _, t in ipairs(terms_info) do
-    if #t.post_keys > 0 then base = t; break end
-  end
-  if not base then return {} end
-
-  local all_bitmap = true
-  local term_entries = {}
-  for i = 1, #terms_info do
-    local t = terms_info[i]
-    local entries = {}
-    for _, k in ipairs(t.post_keys) do
-      local e = store:find_key(k)
-      if e and e.full_cnt > 0 then
-        entries[#entries + 1] = e
-        if e.kind ~= 1 then all_bitmap = false end
-      end
-    end
-    if #entries == 0 then
-      all_bitmap = false
-      break
-    end
-    term_entries[i] = entries
-  end
-
-  local current
-  if not has_any_pref and all_bitmap and #term_entries == #terms_info then
-    local term_words = {}
-    for i = 1, #term_entries do
-      local tw = {}
-      for j = 1, #term_entries[i] do
-        tw[j] = store:get_words(term_entries[i][j])
-      end
-      term_words[i] = tw
-    end
-    current = bitmap_intersect_words(store, term_words, disabled_blocks)
-  else
-    if has_any_pref then
-      current = get_candidates_for_term(store, base.term, base.mult, 1500,
-                                        base.post_keys, disabled_blocks, true)
-    else
-      current = get_candidates_for_term_full(store, base, disabled_blocks)
-    end
-    if #current == 0 then return {} end
-
-    for _, t in ipairs(terms_info) do
-      if #current == 0 then break end
-      if t ~= base then
-        local filtered = {}
-        local t_entries = {}
-        for _, k in ipairs(t.post_keys) do
-          local e = store:find_key(k)
-          if e then t_entries[#t_entries + 1] = e end
-        end
-        if not t.is_pref and #t_entries > 0 then
-          for _, id in ipairs(current) do
-            for j = 1, #t_entries do
-              if store:full_contains(t_entries[j], id) then
-                filtered[#filtered + 1] = id
-                break
-              end
-            end
-          end
-        else
-          for _, id in ipairs(current) do
-            local cs = store:comp_set(id)
-            local cn = #cs
-            local matched = false
-            local a, b = 1, 1
-            local toks = t.tokens
-            while a <= cn and b <= #toks do
-              if cs[a] == toks[b] then matched = true; break
-              elseif cs[a] < toks[b] then a = a + 1
-              else b = b + 1 end
-            end
-            if not matched then
-              for j = 1, #t_entries do
-                if store:full_contains(t_entries[j], id) then matched = true; break end
-              end
-            end
-            if matched then filtered[#filtered + 1] = id end
-          end
-        end
-        current = filtered
-      end
-    end
-  end
-  local exact = lookup_exact_query(store, pq, disabled_blocks)
-  local exact_set
-  current, exact_set = merge_exact_first(exact, current)
-  if #current == 0 then return {} end
-
-  local score_limit = has_any_pref and 500 or 1500
-  local exact_count = 0
-  for _ in pairs(exact_set) do exact_count = exact_count + 1 end
-  score_limit = score_limit + exact_count
-  local n_score = math.min(#current, score_limit)
-  local all_singleton, target_sig = compute_match_sig(matchers)
-  local scores = {}
-  for i = 1, n_score do
-    local id = current[i]
-    local sc = score_candidate(store, id, matchers, order_count,
-                               all_singleton, target_sig)
-    if exact_set[id] then sc = boost_exact_structure(sc) end
-    scores[i] = sc
-  end
-  local results = top_k_ids(current, scores, n_score, max_results)
-  cache_put(query_cache, cache_key, results, 256)
-  return results
-end
 
 -- ---------------------------------------------------------------------------
 -- 混合检字：O 模式查询代数、分解、排序
@@ -3921,8 +3137,9 @@ end
 
 local function default_config()
   return {
-    search = { prefix = "I", tag = "ids_reverse_search", tips = "〔部件检字〕" },
-    hybrid = { prefix = "O", tag = "ids_reverse_hybrid", tips = "〔汉字部件检字〕" },
+    prefix = "O",
+    tag = "ids_reverse_hybrid",
+    tips = "〔汉字部件检字〕",
     data_path = "ids_data.bin",
     custom_path = "",
     algebra = {},
@@ -3981,12 +3198,9 @@ local function load_config(env)
     return dst
   end
 
-  cfg.search.prefix = get_s("search_prefix", cfg.search.prefix)
-  cfg.search.tag = get_s("search_tag", cfg.search.tag)
-  cfg.search.tips = get_s("search_tips", cfg.search.tips)
-  cfg.hybrid.prefix = get_s("hybrid_prefix", cfg.hybrid.prefix)
-  cfg.hybrid.tag = get_s("hybrid_tag", cfg.hybrid.tag)
-  cfg.hybrid.tips = get_s("hybrid_tips", cfg.hybrid.tips)
+  cfg.prefix = get_s("prefix", cfg.prefix)
+  cfg.tag = get_s("tag", cfg.tag)
+  cfg.tips = get_s("tips", cfg.tips)
   cfg.data_path = get_s("data_file", cfg.data_path)
   cfg.custom_path = get_s("custom_file", cfg.custom_path)
   cfg.algebra = get_algebra(conf, ns)
@@ -4101,7 +3315,7 @@ local function retag_last_segment(ctx, env)
   end
   if not ctx.composition:empty() then
     local sep = ctx.composition:back()
-    sep.tags = Set({ env.config.hybrid.tag, RESULT_SEGMENT_TAG })
+    sep.tags = Set({ env.config.tag, RESULT_SEGMENT_TAG })
     sep.status = "kVoid"
   end
   ctx.input = ctx.input
@@ -4178,7 +3392,7 @@ end
 -- 把后缀运算符作为一个独立状态层追加到输入末尾。
 local function rpn_append(ctx, env, st, op)
   if not ctx.composition:empty()
-     and ctx.composition:back():has_tag(env.config.hybrid.tag) then
+     and ctx.composition:back():has_tag(env.config.tag) then
     ctx:clear_non_confirmed_composition()
   end
   st.components[#st.components + 1] = op
@@ -4208,7 +3422,7 @@ end
 
 local function handle_ids_hotkey(key_event, ctx, env)
   if ctx.composition:empty() then return false end
-  if not is_reverse_active(ctx, env.config.hybrid.prefix) then return false end
+  if not is_reverse_active(ctx, env.config.prefix) then return false end
   local code = key_event.keycode
   local ctrl, alt, shift = key_event:ctrl(), key_event:alt(), key_event:shift()
   local is_return = code == 0xFF0D or code == 0xFF8D
@@ -4267,13 +3481,13 @@ local function matches_variant_replace_key(key_event, env)
 end
 
 local function try_replace_variant(ctx, env)
-  if not ctx or not is_reverse_active(ctx, env.config.hybrid.prefix) then
+  if not ctx or not is_reverse_active(ctx, env.config.prefix) then
     return false
   end
   if ctx:get_property(VARIANTS_PROPERTY) == "" then return false end
   if not ctx:has_menu() or ctx.composition:empty() then return false end
 
-  local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+  local st = read_hybrid_state(ctx, env.config.prefix)
   local trigger = env.config.variant_trigger
   if not ends_with(st.pending, trigger) then return false end
 
@@ -4299,14 +3513,14 @@ local function try_replace_variant(ctx, env)
     expression = expression .. component
     save_hybrid_state(ctx, {}, {})
     ctx:clear()
-    ctx.input = env.config.hybrid.prefix .. expression
+    ctx.input = env.config.prefix .. expression
   else
     local components = {}
     for _, c in ipairs(st.components) do components[#components + 1] = c end
     components[#components + 1] = component
     local codes = {}
     for _, c in ipairs(components) do codes[#codes + 1] = c end
-    local input = env.config.hybrid.prefix
+    local input = env.config.prefix
     for _, code in ipairs(codes) do input = input .. code .. "'" end
     save_hybrid_state(ctx, components, codes)
     ctx:clear()
@@ -4316,7 +3530,7 @@ local function try_replace_variant(ctx, env)
 end
 
 local function on_select(ctx, env)
-  if not is_reverse_active(ctx, env.config.hybrid.prefix) then return end
+  if not is_reverse_active(ctx, env.config.prefix) then return end
   local seg = selected_segment(ctx)
   if not seg then return end
   local cand = prepare_selected_candidate(seg)
@@ -4340,7 +3554,7 @@ local function on_select(ctx, env)
     return
   end
 
-  local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+  local st = read_hybrid_state(ctx, env.config.prefix)
 
   local tail = ""
   if cand._end > 0 and cand._end < #ctx.input then
@@ -4358,9 +3572,9 @@ local function on_select(ctx, env)
 end
 
 local function on_update(ctx, env)
-  if not is_reverse_active(ctx, env.config.hybrid.prefix) then return end
+  if not is_reverse_active(ctx, env.config.prefix) then return end
   if not ctx.composition:empty() then
-    ctx.composition:back().prompt = env.config.hybrid.tips
+    ctx.composition:back().prompt = env.config.tips
   end
 end
 
@@ -4389,17 +3603,13 @@ local function processor_func(key_event, env)
   local ctx = env.engine.context
   if not ctx then return 2 end
 
-  if not is_reverse_active(ctx, env.config.hybrid.prefix) then
+  if not is_reverse_active(ctx, env.config.prefix) then
     if not ctx:get_option("ascii_mode") and not ctx:is_composing() then
       local ctrl, alt = key_event:ctrl(), key_event:alt()
       if not ctrl and not alt then
         local repr = key_event:repr()
-        if repr == env.config.search.prefix then
-          ctx:push_input(env.config.search.prefix)
-          return 1
-        end
-        if repr == env.config.hybrid.prefix then
-          ctx:push_input(env.config.hybrid.prefix)
+        if repr == env.config.prefix then
+          ctx:push_input(env.config.prefix)
           enter_o_mode(ctx)
           return 1
         end
@@ -4425,9 +3635,9 @@ local function processor_func(key_event, env)
   end
 
   if code == 0xFF0D or code == 0xFF8D or repr == "Return" then
-    local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+    local st = read_hybrid_state(ctx, env.config.prefix)
     if #st.components == 0 and st.pending == "" then
-      env.engine:commit_text(env.config.hybrid.prefix)
+      env.engine:commit_text(env.config.prefix)
       leave_o_mode(ctx)
       ctx:clear()
       return 1
@@ -4466,7 +3676,7 @@ local function processor_func(key_event, env)
 
   if code == 0xFF08 or repr == "BackSpace" then
     ctx:set_property(VARIANTS_RESULT_PROPERTY, "")
-    local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+    local st = read_hybrid_state(ctx, env.config.prefix)
     if st.pending ~= "" then
       local pending_chars = utf8_length(st.pending)
       local pending_bytes = last_utf8_char_bytes(st.pending)
@@ -4558,7 +3768,7 @@ local function processor_func(key_event, env)
     end
     local base = is_result and genuine and genuine.text or cand.text
     if is_result then
-      local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+      local st = read_hybrid_state(ctx, env.config.prefix)
       if st.pending == "" and #st.components == 1
          and utf8_length(st.components[1]) == 1
          and st.components[1] ~= base and not has_variants(base) then
@@ -4566,7 +3776,7 @@ local function processor_func(key_event, env)
         ctx:set_property(VARIANTS_PROPERTY, component)
         save_hybrid_state(ctx, {}, {})
         ctx:clear()
-        ctx.input = env.config.hybrid.prefix .. component
+        ctx.input = env.config.prefix .. component
                     .. env.config.variant_trigger
         return 1
       end
@@ -4583,7 +3793,7 @@ local function processor_func(key_event, env)
   if is_letter or is_minus or is_plus or is_exclude then
     local variant_result = ctx:get_property(VARIANTS_RESULT_PROPERTY)
     if variant_result ~= "" then
-      local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+      local st = read_hybrid_state(ctx, env.config.prefix)
       local already_component = #st.components > 0
                                 and st.components[#st.components] == variant_result
       ctx:set_property(VARIANTS_RESULT_PROPERTY, "")
@@ -4593,12 +3803,12 @@ local function processor_func(key_event, env)
         if display == "" then display = variant_result end
         save_hybrid_state(ctx, { variant_result }, { display })
         ctx:clear()
-        ctx.input = env.config.hybrid.prefix .. display .. "'"
+        ctx.input = env.config.prefix .. display .. "'"
       end
     end
 
     if is_minus or is_plus or is_exclude then
-      local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+      local st = read_hybrid_state(ctx, env.config.prefix)
       if st.pending == "" then
         local op = is_minus and "-" or (is_plus and "+" or "!")
         if #st.components > 0 and rpn_can_apply(st.components, op) then
@@ -4616,7 +3826,7 @@ local function processor_func(key_event, env)
     if ch:match("^[A-Z]$") then ch = ascii_lower(ch) end
     if ctx.caret_pos ~= #ctx.input then ctx.caret_pos = #ctx.input end
     if not ctx.composition:empty()
-       and ctx.composition:back():has_tag(env.config.hybrid.tag) then
+       and ctx.composition:back():has_tag(env.config.tag) then
       ctx:clear_non_confirmed_composition()
     end
     ctx:set_property(VARIANTS_PROPERTY, "")
@@ -4641,22 +3851,10 @@ local function segmentor_func(segmentation, env)
   local input = segmentation.input
   local start = segmentation:get_current_start_position()
 
-  if start == 0 and (not ctx or not ctx:get_option("ascii_mode"))
-     and starts_with(input, env.config.search.prefix) then
-    local seg = Segment(0, #input)
-    seg.tags = Set({ env.config.search.tag })
-    seg.prompt = env.config.search.tips
-    if not segmentation:add_segment(seg) then return true end
-    if not segmentation:empty() then
-      segmentation:back().prompt = env.config.search.tips
-    end
-    return false
-  end
-
-  if not is_reverse_active(ctx, env.config.hybrid.prefix) then return true end
+  if not is_reverse_active(ctx, env.config.prefix) then return true end
   if start >= #input then return false end
 
-  local prefix_end = (start == 0) and #env.config.hybrid.prefix or start + 1
+  local prefix_end = (start == 0) and #env.config.prefix or start + 1
   local is_prefix = (start == 0)
                     or (start < #input and input:sub(start + 1, start + 1) == "'")
 
@@ -4668,9 +3866,9 @@ local function segmentor_func(segmentation, env)
   elseif is_prefix then
     seg = Segment(start, #input)
     if start == 0 then
-      seg.tags = Set({ env.config.hybrid.tag })
+      seg.tags = Set({ env.config.tag })
     else
-      seg.tags = Set({ env.config.hybrid.tag, RESULT_SEGMENT_TAG })
+      seg.tags = Set({ env.config.tag, RESULT_SEGMENT_TAG })
     end
   else
     local next_quote = input:find("'", start + 2, true)
@@ -4684,7 +3882,7 @@ local function segmentor_func(segmentation, env)
         seg.tags = Set({ "confirmed_component" })
       elseif start + 1 == #input then
         seg = Segment(start, #input)
-        seg.tags = Set({ env.config.hybrid.tag, RESULT_SEGMENT_TAG })
+        seg.tags = Set({ env.config.tag, RESULT_SEGMENT_TAG })
       else
         seg = Segment(start, start + 1)
         seg.status = "kConfirmed"
@@ -4707,7 +3905,7 @@ local function segmentor_func(segmentation, env)
       end
     end
   end
-  seg.prompt = env.config.hybrid.tips
+  seg.prompt = env.config.tips
   segmentation:add_segment(seg)
   return false
 end
@@ -4730,49 +3928,6 @@ local function show_options(config, ctx)
   return show_pinyin, show_ids, show_unicode, show_block
 end
 
-local function build_search_candidates(store, results, preedit, start_pos,
-                                       end_pos, config, ctx)
-  local show_pinyin, show_ids, show_unicode, show_block = show_options(config, ctx)
-  local emitted = 0
-  for _, id in ipairs(results) do
-    local comment = build_comment(store, id, show_pinyin, show_ids,
-                                  show_unicode, show_block, config.ids_format)
-    local ch = cp_to_utf8(store:cp_of_id(id))
-    local cand = Candidate("ids_reverse", start_pos, end_pos, ch, comment)
-    cand.preedit = preedit
-    cand.quality = 100.0
-    yield(cand)
-    emitted = emitted + 1
-  end
-  return emitted
-end
-
-local function query_search(input, segment, env)
-  local start_pos, end_pos = segment.start, segment._end
-  local query_raw = input
-  local prefix = env.config.search.prefix
-  if prefix ~= "" then
-    if not starts_with(input, prefix) then return end
-    query_raw = input:sub(#prefix + 1)
-  end
-  if query_raw == "" then
-    local cand = Candidate("ids_reverse", start_pos, end_pos, "",
-                           env.config.search.tips)
-    cand.preedit = input .. " " .. env.config.search.tips
-    cand.quality = 100.0
-    yield(cand)
-    return
-  end
-  local store = ensure_store(env.config)
-  if not store then return end
-  local codec = get_codec(store, env.config)
-  local results = search_components(store, query_raw, env.config.max_results,
-                                    codec, env.config.disabled_blocks_enabled
-                                          and env.config.disabled_blocks or nil)
-  if #results == 0 then return end
-  build_search_candidates(store, results, prefix == "" and "" or input,
-                          start_pos, end_pos, env.config, env.engine.context)
-end
 
 local function build_result_candidates(store, results, segment, pending,
                                        config, ctx)
@@ -4978,14 +4133,14 @@ end
 
 local function query_hybrid(segment, env)
   local ctx = env.engine.context
-  if not ctx or not is_reverse_active(ctx, env.config.hybrid.prefix) then return end
-  local has_hybrid = segment:has_tag(env.config.hybrid.tag)
+  if not ctx or not is_reverse_active(ctx, env.config.prefix) then return end
+  local has_hybrid = segment:has_tag(env.config.tag)
   local has_component = segment:has_tag("hanzi_component")
   if not has_hybrid and not has_component then return end
   local store = ensure_store(env.config)
   if not store then return end
 
-  local st = read_hybrid_state(ctx, env.config.hybrid.prefix)
+  local st = read_hybrid_state(ctx, env.config.prefix)
   local pending = st.pending
   local variant_pending = ends_with(pending, env.config.variant_trigger)
   local variant_result = ctx:get_property(VARIANTS_RESULT_PROPERTY)
@@ -5078,11 +4233,7 @@ local function translator_init(env)
 end
 
 local function translator_func(input, segment, env)
-  if segment:has_tag(env.config.search.tag) then
-    query_search(input, segment, env)
-  else
-    query_hybrid(segment, env)
-  end
+  query_hybrid(segment, env)
 end
 
 -- ---------------------------------------------------------------------------
@@ -5100,9 +4251,7 @@ local function filter_func(input, env)
     return
   end
 
-  if ctx.input == env.config.search.prefix then return end
-
-  if not is_reverse_active(ctx, env.config.hybrid.prefix) then
+  if not is_reverse_active(ctx, env.config.prefix) then
     for cand in input:iter() do yield(cand) end
     return
   end
@@ -5146,8 +4295,7 @@ local function filter_applies_to_segment(seg, env)
   local ctx = env.engine.context
   if not ctx or ctx:get_option("ascii_mode") then return false end
   local inp = ctx.input or ""
-  return starts_with(inp, env.config.search.prefix)
-      or starts_with(inp, env.config.hybrid.prefix)
+  return starts_with(inp, env.config.prefix)
 end
 
 M.processor = { init = processor_init, func = processor_func, fini = processor_fini }
@@ -5163,7 +4311,6 @@ M.filter = {
 M._internal = {
   Store = Store,
   store = function() return store_instance end,
-  search_components = search_components,
   search_hybrid = search_hybrid,
   get_component_candidates = get_component_candidates,
   get_pinyin_candidates = get_pinyin_candidates,

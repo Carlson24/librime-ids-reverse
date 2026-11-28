@@ -19,7 +19,6 @@
 
 #include "ids_reverse_config.h"
 #include "ids_reverse_input.h"
-#include "ids_reverse_search.h"
 #include "ids_store.h"
 #include "ids_text.h"
 
@@ -86,7 +85,7 @@ void AppendRpnOperator(Context* ctx,
                        char op) {
   std::string token(1, op);
   if (!ctx->composition().empty() &&
-      ctx->composition().back().HasTag(config.hybrid.tag)) {
+      ctx->composition().back().HasTag(config.tag)) {
     ctx->ClearNonConfirmedComposition();
   }
   st->components.push_back(token);
@@ -110,7 +109,7 @@ void RetagLastSegmentForTranslation(Context* ctx, const ReverseConfig& config) {
   if (!ctx->composition().empty()) {
     Segment& sep = ctx->composition().back();
     sep.tags.clear();
-    sep.tags.insert(config.hybrid.tag);
+    sep.tags.insert(config.tag);
     sep.tags.insert(kResultSegmentTag);
     sep.status = Segment::kVoid;
   }
@@ -152,7 +151,7 @@ IdsReverseProcessor::~IdsReverseProcessor() {
 }
 
 void IdsReverseProcessor::OnSelectBefore(Context* ctx) {
-  if (!IsReverseActive(ctx, config_.hybrid.prefix))
+  if (!IsReverseActive(ctx, config_.prefix))
     return;
   if (ctx->composition().empty())
     return;
@@ -195,7 +194,7 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
   } else {
     ctx->set_property(kVariantsProperty, "");
     ctx->set_property(kVariantsResultProperty, "");
-    HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+    HybridState st = ReadHybridState(ctx, config_.prefix);
     std::string text = selected_component_;
     std::string base =
         ctx->input().substr(0, ctx->input().size() - st.pending.size());
@@ -214,17 +213,17 @@ void IdsReverseProcessor::OnSelectAfter(Context* ctx) {
 }
 
 void IdsReverseProcessor::OnUpdate(Context* ctx) {
-  if (!IsReverseActive(ctx, config_.hybrid.prefix))
+  if (!IsReverseActive(ctx, config_.prefix))
     return;
   if (!ctx->composition().empty())
-    ctx->composition().back().prompt = config_.hybrid.tips;
+    ctx->composition().back().prompt = config_.tips;
 }
 
 bool IdsReverseProcessor::HandleIdsHotkey(const rime::KeyEvent& key_event,
                                           Context* ctx) {
   if (!ctx || ctx->composition().empty())
     return false;
-  if (!IsReverseActive(ctx, config_.hybrid.prefix))
+  if (!IsReverseActive(ctx, config_.prefix))
     return false;
   const int code = key_event.keycode();
   const bool ctrl = key_event.ctrl();
@@ -322,14 +321,14 @@ bool IdsReverseProcessor::MatchesVariantReplaceKey(
 }
 
 bool IdsReverseProcessor::TryReplaceVariant(Context* ctx) {
-  if (!ctx || !IsReverseActive(ctx, config_.hybrid.prefix))
+  if (!ctx || !IsReverseActive(ctx, config_.prefix))
     return false;
   if (ctx->get_property(kVariantsProperty).empty())
     return false;
   if (!ctx->HasMenu() || ctx->composition().empty())
     return false;
 
-  HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+  HybridState st = ReadHybridState(ctx, config_.prefix);
   const std::string& trigger = config_.variant_trigger;
   if (!EndsWith(st.pending, trigger))
     return false;
@@ -365,14 +364,14 @@ bool IdsReverseProcessor::TryReplaceVariant(Context* ctx) {
     expression += component;
     SaveHybridState(ctx, {}, {});
     ctx->Clear();
-    ctx->set_input(config_.hybrid.prefix + expression);
+    ctx->set_input(config_.prefix + expression);
   } else {
     // 替换的是待输入原字（O葵/）：把异体字直接作为已加入的部件，
     // 这样后续输入 - / + / ! 时能正常作用于它。
     std::vector<std::string> components = st.components;
     components.push_back(component);
     std::vector<std::string> codes = components;
-    std::string input = config_.hybrid.prefix;
+    std::string input = config_.prefix;
     for (const auto& code : codes) {
       input += code;
       input += "'";
@@ -401,17 +400,11 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   const bool alt = key_event.alt();
   const bool shift = key_event.shift();
 
-  if (!IsReverseActive(ctx, config_.hybrid.prefix)) {
+  if (!IsReverseActive(ctx, config_.prefix)) {
     if (!ctx->get_option("ascii_mode") && !ctrl && !alt &&
-        !ctx->IsComposing()) {
-      if (repr == config_.search.prefix) {
-        ctx->PushInput(config_.search.prefix);
-        return rime::kAccepted;
-      }
-      if (repr == config_.hybrid.prefix) {
-        ctx->PushInput(config_.hybrid.prefix);
-        return rime::kAccepted;
-      }
+        !ctx->IsComposing() && repr == config_.prefix) {
+      ctx->PushInput(config_.prefix);
+      return rime::kAccepted;
     }
     return rime::kNoop;
   }
@@ -424,9 +417,9 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
   }
 
   if (code == XK_Return || code == XK_KP_Enter || repr == "Return") {
-    HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+    HybridState st = ReadHybridState(ctx, config_.prefix);
     if (st.components.empty() && st.pending.empty()) {
-      engine_->CommitText(config_.hybrid.prefix);
+      engine_->CommitText(config_.prefix);
       ctx->Clear();
       return rime::kAccepted;
     }
@@ -468,7 +461,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
 
   if (code == XK_BackSpace || repr == "BackSpace") {
     ctx->set_property(kVariantsResultProperty, "");
-    HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+    HybridState st = ReadHybridState(ctx, config_.prefix);
     if (!st.pending.empty()) {
       const size_t pending_chars = Utf8Length(st.pending);
       size_t pending_bytes = LastUtf8CharBytes(st.pending);
@@ -575,7 +568,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     // 若高亮结果没有异体字，则回退为查询该部件本身：
     // O葵 → 空格 → / 应显示 葵 的异体字，而不是当前结果。
     if (is_result) {
-      HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+      HybridState st = ReadHybridState(ctx, config_.prefix);
       if (st.pending.empty() && st.components.size() == 1 &&
           Utf8Length(st.components[0]) == 1 && st.components[0] != base &&
           !HasVariants(base)) {
@@ -583,8 +576,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
         ctx->set_property(kVariantsProperty, component);
         SaveHybridState(ctx, {}, {});
         ctx->Clear();
-        ctx->set_input(config_.hybrid.prefix + component +
-                       config_.variant_trigger);
+        ctx->set_input(config_.prefix + component + config_.variant_trigger);
         return rime::kAccepted;
       }
     }
@@ -603,7 +595,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     const std::string variant_result =
         ctx->get_property(kVariantsResultProperty);
     if (!variant_result.empty()) {
-      HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+      HybridState st = ReadHybridState(ctx, config_.prefix);
       bool already_component =
           !st.components.empty() && st.components.back() == variant_result;
       ctx->set_property(kVariantsResultProperty, "");
@@ -616,11 +608,11 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
           display = variant_result;
         SaveHybridState(ctx, {variant_result}, {display});
         ctx->Clear();
-        ctx->set_input(config_.hybrid.prefix + display + "'");
+        ctx->set_input(config_.prefix + display + "'");
       }
     }
     if (is_minus || is_plus || is_exclude) {
-      HybridState st = ReadHybridState(ctx, config_.hybrid.prefix);
+      HybridState st = ReadHybridState(ctx, config_.prefix);
       if (st.pending.empty()) {
         char op = is_minus ? '-' : (is_plus ? '+' : '!');
         if (!st.components.empty() && CanApplyRpnOperator(st.components, op)) {
@@ -641,7 +633,7 @@ rime::ProcessResult IdsReverseProcessor::ProcessKeyEvent(
     if (ctx->caret_pos() != ctx->input().size())
       ctx->set_caret_pos(ctx->input().size());
     if (!ctx->composition().empty() &&
-        ctx->composition().back().HasTag(config_.hybrid.tag)) {
+        ctx->composition().back().HasTag(config_.tag)) {
       ctx->ClearNonConfirmedComposition();
     }
     ctx->set_property(kVariantsProperty, "");
@@ -669,42 +661,29 @@ bool IdsReverseSegmentor::Proceed(Segmentation* segmentation) {
   const std::string& input = segmentation->input();
   size_t start = segmentation->GetCurrentStartPosition();
 
-  // search 模式：整段输入打标签，交给 translator 直接检索。
-  if (start == 0 && (!ctx || !ctx->get_option("ascii_mode")) &&
-      StartsWith(input, config_.search.prefix)) {
-    Segment seg(0, static_cast<int>(input.size()));
-    seg.tags.insert(config_.search.tag);
-    seg.prompt = config_.search.tips;
-    if (!segmentation->AddSegment(seg))
-      return true;
-    if (!segmentation->empty())
-      segmentation->back().prompt = config_.search.tips;
-    return false;
-  }
-
-  if (!IsReverseActive(ctx, config_.hybrid.prefix))
+  if (!IsReverseActive(ctx, config_.prefix))
     return true;
 
   if (start >= input.size())
     return false;
 
-  size_t prefix_end = (start == 0) ? config_.hybrid.prefix.size() : start + 1;
+  size_t prefix_end = (start == 0) ? config_.prefix.size() : start + 1;
   bool is_prefix =
       (start == 0) || (start < input.size() && input[start] == '\'');
 
   Segment seg;
   if (is_prefix && prefix_end < input.size()) {
     seg = Segment(static_cast<int>(start), static_cast<int>(prefix_end));
-    // 保留 hybrid 前缀在组字区显示；引号分隔符仍隐藏。
+    // 保留 O 模式前缀在组字区显示；引号分隔符仍隐藏。
     if (start != 0)
       seg.tags.insert("phony");
     seg.status = Segment::kConfirmed;
   } else if (is_prefix) {
     seg = Segment(static_cast<int>(start), static_cast<int>(input.size()));
     if (start == 0) {
-      seg.tags.insert(config_.hybrid.tag);
+      seg.tags.insert(config_.tag);
     } else {
-      seg.tags.insert(config_.hybrid.tag);
+      seg.tags.insert(config_.tag);
       seg.tags.insert(kResultSegmentTag);
     }
   } else {
@@ -720,7 +699,7 @@ bool IdsReverseSegmentor::Proceed(Segmentation* segmentation) {
         seg.tags.insert("confirmed_component");
       } else if (start + 1 == input.size()) {
         seg = Segment(static_cast<int>(start), static_cast<int>(input.size()));
-        seg.tags.insert(config_.hybrid.tag);
+        seg.tags.insert(config_.tag);
         seg.tags.insert(kResultSegmentTag);
       } else {
         seg = Segment(static_cast<int>(start), static_cast<int>(start + 1));
@@ -738,7 +717,7 @@ bool IdsReverseSegmentor::Proceed(Segmentation* segmentation) {
     }
   }
 
-  seg.prompt = config_.hybrid.tips;
+  seg.prompt = config_.tips;
   segmentation->AddSegment(seg);
   return false;
 }
@@ -818,21 +797,6 @@ IdsReverseFilter::IdsReverseFilter(const rime::Ticket& ticket)
   LoadReverseConfig(ticket, &name_space_, &config_);
 }
 
-bool IdsReverseFilter::AppliesToSegment(Segment* segment) {
-  suppress_ = false;
-  Context* ctx = engine_ ? engine_->context() : nullptr;
-  if (!ctx || !segment || ctx->get_option("ascii_mode"))
-    return true;
-  if (ctx->input() != config_.search.prefix)
-    return true;
-  if (segment->start != 0 ||
-      segment->end != static_cast<size_t>(config_.search.prefix.size())) {
-    return true;
-  }
-  suppress_ = true;
-  return true;
-}
-
 an<rime::Translation> IdsReverseFilter::Apply(an<rime::Translation> translation,
                                               rime::CandidateList* candidates) {
   (void)candidates;
@@ -840,12 +804,7 @@ an<rime::Translation> IdsReverseFilter::Apply(an<rime::Translation> translation,
   if (!ctx)
     return translation;
 
-  if (suppress_) {
-    suppress_ = false;
-    return New<rime::FifoTranslation>();
-  }
-
-  if (!IsReverseActive(ctx, config_.hybrid.prefix))
+  if (!IsReverseActive(ctx, config_.prefix))
     return translation;
 
   // 初始 O / 前缀段既不是部件选择段，也不是结果段。

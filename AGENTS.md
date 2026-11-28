@@ -1,8 +1,8 @@
 # AGENTS.md — rime-ids-reverse
 
 Librime plugin providing **IDS component search** (部件检字). It answers
-queries such as `I木口`, `Ikouhao`, `O木木`, and `O森木-氵+` from a single
-memory-mapped `ids_data.bin` file.
+queries such as `O木木` and `O森木-氵+` from a single memory-mapped
+`ids_data.bin` file.
 
 There are two interchangeable implementations of the same behavior:
 
@@ -22,7 +22,7 @@ Chinese; preserve that.
 | `src/ids_text.{h,cc}` | UTF-8/IDS helpers, `FormatIds`, block names, candidate comments. |
 | `src/ids_reverse_composer.{h,cc}` | `IdsReverseProcessor`, `IdsReverseSegmentor`, `IdsReverseFilter`; all key handling. |
 | `src/ids_reverse_input.{h,cc}` | `InputCodec`: apply `ids_reverse/algebra` to the toneless pinyin syllabary, segment input codes, exact/prefix lookup. |
-| `src/ids_reverse_translator.{h,cc}` | Translator, I-mode search, O-mode candidate construction. |
+| `src/ids_reverse_translator.{h,cc}` | Translator, O-mode candidate construction. |
 | `src/ids_reverse_search.{h,cc}` | O-mode `SearchHybrid` (RPN add/subtract/exclude algebra) and component candidates. |
 | `ids_reverse.lua` | Whole Lua implementation; exports `processor`/`segmentor`/`translator`/`filter` and `_internal` for tests. |
 | `data/` | Generator, raw input tables, ignored outputs. |
@@ -85,7 +85,7 @@ lua5.5 plugins/ids-reverse/tests/bench_ids_reverse.lua
 - They use `M._internal`; keep that table usable when refactoring.
 - There are **no C++ unit tests** in this plugin. Verify C++ changes by loading
   the plugin in a real frontend and running the checks listed in the README
-  (I mode, O mode, subtraction/addition/exclusion, variants, hotkeys).
+  (O mode, subtraction/addition/exclusion, variants, hotkeys).
 
 Inspect the binary data with:
 
@@ -128,21 +128,18 @@ Run it from `data/`; all input paths are relative. It reads `IDS_raw.TXT`,
 ### Components and configuration
 
 All four components share one namespace (`ids_reverse` by default, overridable
-by the ticket namespace). Shared settings live at the top level; only
-`prefix`, `tag`, and `tips` are split into `search_*` and `hybrid_*`.
+by the ticket namespace). The single O mode is configured by top-level
+`prefix` (default `O`), `tag`, and `tips`. Legacy `search_*` and `hybrid_*`
+keys are ignored; I mode no longer exists. Component algebra is always
+**RPN/postfix**: operands first, then `+`/`-`/`!`; there is no infix mode or
+notation option.
 
-- I mode = **search**: `search_prefix` (default `I`), `search_tag`,
-  `search_tips`.
-- O mode = **hybrid**: `hybrid_prefix` (default `O`), `hybrid_tag`,
-  `hybrid_tips`. Component algebra is always **RPN/postfix**: operands first,
-  then `+`/`-`/`!`; there is no infix mode or notation option.
 - Input encoding: `algebra` is a list of Rime spelling-algebra rules. Empty
   means identity/full pinyin. Rules are applied to the toneless syllable set to
   produce `code -> pinyin`, exactly like `DictCompiler::BuildPrism`.
 
-If both prefixes are equal, search mode wins. Config defaults and normalization
-live in `ReverseConfig` and `LoadReverseConfig`; mirror them in the Lua
-`load_config` defaults.
+Config defaults and normalization live in `ReverseConfig` and
+`LoadReverseConfig`; mirror them in the Lua `load_config` defaults.
 
 Load the store lazily through `EnsureIdsStoreLoaded` / `EnsureLoaded`; never
 load ~30 MB of data in a component constructor.
@@ -165,23 +162,7 @@ from it, then `rime::Projection` applies `ids_reverse/algebra`. The resulting
 - The Lua implementation mirrors this with a bundled Boost.Regex subset
   (`xlit`, `xform`, `erase`, `derive`, `fuzz`, `abbrev`, `reorder`).
 
-### I mode (search)
-
-1. `IdsReverseProcessor` accepts the leading prefix when idle and not in
-   `ascii_mode`, pushing it into the context.
-2. `IdsReverseSegmentor` tags the whole input with `search_tag`.
-3. `IdsReverseTranslator::QuerySearch` strips the prefix. Empty query yields a
-   tips-only candidate; otherwise it calls `SearchComponents`.
-4. `IdsReverseFilter` suppresses other translators when the input is exactly the
-   bare prefix.
-
-`SearchComponents` handles components and codes produced by `InputCodec`; stems are
-ANDed, then scored (`ScoreCandidate`) by direct/ordered match, atomic-match
-tier, frequency, and depth. Component queries also inject exact top-level leaf
-multiset hits from `LEAF_STRUCT` ahead of the normal candidate pool; these hits
-receive a score floor so they are not displaced by high-frequency ALTS matches.
-
-### O mode (hybrid)
+### O mode
 
 State lives in the context property `ids_reverse_components`, one
 `<component>\t<code>\n` line per accepted component. `ReadHybridState` validates
@@ -220,9 +201,9 @@ as a multi-character combo are stored as one layer; Backspace removes
   expression. If the final token is `-` and multiple stack values remain,
   results come from the top value (the just-computed difference) rather than
   intersecting all remaining values. Exact top-level leaf multiset hits from
-  `LEAF_STRUCT` are merged first and scored with the same exact-structure floor
-  as I mode. Hybrid ranking keys are literal original-glyph hits, structural
-  score, frequency, then candidate index. Literal hits are computed from raw
+  `LEAF_STRUCT` are merged first and scored with the common exact-structure
+  floor. Ranking keys are literal original-glyph hits, structural score,
+  frequency, then candidate index. Literal hits are computed from raw
   `LEAVES` tokens recursively and are only evaluated when the query contains a
   `CanonMap` glyph (key or value).
 
@@ -259,7 +240,7 @@ change must update all three and regenerate the binary.
 maps `(len + sorted canonical leaf tokens) -> character ids` and must stay in
 sync across the generator, `IdsStore::LookupLeafStructure`, and
 `Store:lookup_leaf_structure`. Exact structure hits are injected ahead of the
-normal candidate pool and given a score floor in both O and I modes.
+normal candidate pool and given a score floor in O mode.
 
 ## Keeping C++ and Lua in sync
 
@@ -319,7 +300,7 @@ one changed. Applies to:
 | Add component alias | C++ `CanonMap`, generator `EQUIV_GROUPS`, Lua `CANON_MAP` |
 | Add block name/alias | `ids_store.cc`, both `kBlockNames`, Lua tables, dump script |
 | Change input encoding (spelling algebra) | `src/ids_reverse_input.{h,cc}`, `src/ids_reverse_config.{h,cc}`, Lua `build_codec`/`get_codec`, `README.md` |
-| Change search/ranking | `src/ids_reverse_translator.cc` (`SearchComponents`, `ScoreCandidate`) and/or `src/ids_reverse_search.cc` (`SearchHybrid`), plus Lua equivalents |
+| Change search/ranking | `src/ids_reverse_search.cc` (`SearchByLeaves`, `RankHybrid`), plus Lua `search_by_leaves`/`rank_hybrid` |
 | Change O-mode RPN evaluation | `src/ids_reverse_search.{h,cc}` (`EvaluateRpnLayers`/`ExpandRpnOperand`), composer processor, Lua `evaluate_rpn_layers`/`expand_rpn_operand`/`search_hybrid` |
 
 ## Before committing

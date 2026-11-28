@@ -1,5 +1,5 @@
 //
-// ids_reverse_search.h — 混合检字（部件/拼音/输入码 + 加减法）。
+// ids_reverse_search.h — O 模式混合检字（部件/拼音/输入码 + 加减法）。
 //
 #ifndef RIME_IDS_REVERSE_IDS_REVERSE_SEARCH_H_
 #define RIME_IDS_REVERSE_IDS_REVERSE_SEARCH_H_
